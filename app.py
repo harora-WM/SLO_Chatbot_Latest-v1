@@ -1,10 +1,6 @@
 """Streamlit web UI for SLO chatbot."""
 
 import streamlit as st
-import pandas as pd
-from pathlib import Path
-import plotly.express as px
-import plotly.graph_objects as go
 from datetime import datetime
 
 # Import our modules
@@ -17,7 +13,6 @@ from analytics.trend_analyzer import TrendAnalyzer
 from analytics.metrics import MetricsAggregator
 from agent.claude_client import ClaudeClient
 from agent.function_tools import FunctionExecutor, TOOLS
-from utils.config import PROJECT_ROOT
 from utils.logger import setup_logger
 
 logger = setup_logger(__name__)
@@ -38,12 +33,6 @@ st.markdown("""
         font-weight: bold;
         color: #1f77b4;
         margin-bottom: 1rem;
-    }
-    .metric-card {
-        background-color: #f0f2f6;
-        padding: 1rem;
-        border-radius: 0.5rem;
-        margin: 0.5rem 0;
     }
     .chat-message {
         padding: 1rem;
@@ -118,92 +107,6 @@ def initialize_system():
 #         return False
 
 
-def display_dashboard(components):
-    """Display dashboard with key metrics."""
-    st.markdown("<h2>Service Health Dashboard</h2>", unsafe_allow_html=True)
-
-    # Get health overview
-    health_overview = components['metrics_aggregator'].get_service_health_overview()
-
-    # Display metrics in columns
-    col1, col2, col3, col4 = st.columns(4)
-
-    with col1:
-        st.metric(
-            "Total Services",
-            health_overview['total_services'],
-            help="Total number of services"
-        )
-
-    with col2:
-        st.metric(
-            "Healthy Services",
-            health_overview['healthy_services'],
-            f"{health_overview['health_percentage']:.1f}%",
-            help="Services meeting SLO targets"
-        )
-
-    with col3:
-        st.metric(
-            "Degraded Services",
-            health_overview['degraded_services'],
-            help="Services approaching SLO limits"
-        )
-
-    with col4:
-        st.metric(
-            "Violated Services",
-            health_overview['violated_services'],
-            help="Services violating SLO"
-        )
-
-    # Overall metrics
-    col1, col2 = st.columns(2)
-
-    with col1:
-        total_req = health_overview.get('total_requests', 0)
-        st.metric(
-            "Total Requests",
-            f"{total_req:,}" if total_req else "0",
-            help="Total request count"
-        )
-
-    with col2:
-        error_rate = health_overview.get('overall_error_rate', 0)
-        st.metric(
-            "Overall Error Rate",
-            f"{error_rate:.2f}%" if error_rate else "0.00%",
-            help="System-wide error rate"
-        )
-
-    # Top services by volume
-    st.markdown("<h3>Top Services by Volume</h3>", unsafe_allow_html=True)
-    top_services = components['metrics_aggregator'].get_top_services_by_volume(limit=5)
-
-    if top_services:
-        df = pd.DataFrame(top_services)
-        fig = px.bar(
-            df,
-            x='service_name',
-            y='total_requests',
-            title='Top 5 Services by Request Volume',
-            labels={'service_name': 'Service', 'total_requests': 'Total Requests'}
-        )
-        fig.update_xaxes(tickangle=-45)
-        st.plotly_chart(fig, use_container_width=True)
-
-    # SLO violations
-    violations = components['slo_calculator'].get_slo_violations()
-    if violations:
-        st.markdown("<h3>⚠️ Current SLO Violations</h3>", unsafe_allow_html=True)
-        for violation in violations[:5]:
-            with st.expander(f"🔴 {violation['service_name']}"):
-                st.write(f"**Error Rate:** {violation['error_rate']:.2f}%")
-                st.write(f"**Response Time:** {violation['response_time']:.3f}s")
-                st.write("**Violations:**")
-                for reason in violation['violations']:
-                    st.write(f"- {reason}")
-
 
 def display_chat(components):
     """Display chat interface."""
@@ -213,6 +116,8 @@ def display_chat(components):
     if 'messages' not in st.session_state:
         st.session_state.messages = []
 
+   
+  
     # Display chat history
     for message in st.session_state.messages:
         with st.chat_message(message["role"]):
@@ -403,24 +308,30 @@ BAD: "Service looks fine, average latency is stable" (WRONG - ignores percentile
         with st.chat_message("user"):
             st.markdown(prompt)
 
-        # Get Claude response
+        # Get Claude response with streaming
         with st.chat_message("assistant"):
-            with st.spinner("Analyzing..."):
-                try:
-                    response = components['claude_client'].chat(
-                        user_message=prompt,
-                        tools=TOOLS,
-                        tool_executor=components['function_executor'],
-                        system_prompt=system_prompt
-                    )
+            try:
+                # Use streaming for real-time response generation
+                response_placeholder = st.empty()
+                full_response = ""
 
-                    st.markdown(response)
-                    st.session_state.messages.append({"role": "assistant", "content": response})
+                for chunk in components['claude_client'].chat_stream(
+                    user_message=prompt,
+                    tools=TOOLS,
+                    tool_executor=components['function_executor'],
+                    system_prompt=system_prompt
+                ):
+                    full_response += chunk
+                    response_placeholder.markdown(full_response + "▌")
 
-                except Exception as e:
-                    error_msg = f"Error: {str(e)}"
-                    st.error(error_msg)
-                    logger.error(f"Chat error: {e}")
+                # Final update without cursor
+                response_placeholder.markdown(full_response)
+                st.session_state.messages.append({"role": "assistant", "content": full_response})
+
+            except Exception as e:
+                error_msg = f"Error: {str(e)}"
+                st.error(error_msg)
+                logger.error(f"Chat error: {e}")
 
 
 def main():
@@ -572,18 +483,8 @@ def main():
         - What are the slowest services?
         """)
 
-    # Main content tabs
-    tab1, tab2 = st.tabs(["📊 Dashboard", "💬 Chat"])
-
-    with tab1:
-        try:
-            display_dashboard(components)
-        except Exception as e:
-            st.error(f"Dashboard error: {str(e)}")
-            st.info("Please load data first using the sidebar button.")
-
-    with tab2:
-        display_chat(components)
+    # Main content - Chat interface
+    display_chat(components)
 
 
 if __name__ == "__main__":

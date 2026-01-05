@@ -280,6 +280,163 @@ class ClaudeClient:
 
         return text_response
 
+    def chat_stream(self,
+                   user_message: str,
+                   tools: Optional[List[Dict[str, Any]]] = None,
+                   tool_executor: Optional[Any] = None,
+                   system_prompt: Optional[str] = None,
+                   max_tool_iterations: int = 5):
+        """Complete chat interaction with streaming support.
+
+        Args:
+            user_message: User's message
+            tools: Optional tool definitions
+            tool_executor: Optional tool executor
+            system_prompt: Optional system prompt
+            max_tool_iterations: Maximum number of tool call iterations
+
+        Yields:
+            Text chunks as they are generated
+        """
+        # Add user message to history
+        self.conversation_history.append({
+            "role": "user",
+            "content": user_message
+        })
+
+        # Prepare request
+        request_body = {
+            "anthropic_version": "bedrock-2023-05-31",
+            "max_tokens": 8192,
+            "messages": self.conversation_history,
+            "temperature": 0.7
+        }
+
+        if system_prompt:
+            request_body["system"] = system_prompt
+
+        if tools:
+            request_body["tools"] = tools
+
+        iterations = 0
+        while iterations <= max_tool_iterations:
+            try:
+                # Call Bedrock API with streaming
+                response = self.bedrock.invoke_model_with_response_stream(
+                    modelId=self.model_id,
+                    body=json.dumps(request_body)
+                )
+
+                # Process the stream
+                full_response_text = ""
+                tool_uses = []
+                current_tool_use = None
+                stop_reason = None
+
+                for event in response['body']:
+                    chunk = json.loads(event['chunk']['bytes'].decode())
+
+                    if chunk['type'] == 'content_block_start':
+                        block = chunk.get('content_block', {})
+                        if block.get('type') == 'tool_use':
+                            current_tool_use = {
+                                'id': block.get('id'),
+                                'name': block.get('name'),
+                                'input_json': ''
+                            }
+
+                    elif chunk['type'] == 'content_block_delta':
+                        delta = chunk.get('delta', {})
+                        if delta.get('type') == 'text_delta':
+                            text = delta.get('text', '')
+                            full_response_text += text
+                            yield text
+                        elif delta.get('type') == 'input_json_delta':
+                            if current_tool_use:
+                                current_tool_use['input_json'] += delta.get('partial_json', '')
+
+                    elif chunk['type'] == 'content_block_stop':
+                        if current_tool_use:
+                            try:
+                                current_tool_use['input'] = json.loads(current_tool_use['input_json']) if current_tool_use['input_json'] else {}
+                            except json.JSONDecodeError:
+                                current_tool_use['input'] = {}
+                            tool_uses.append({
+                                'type': 'tool_use',
+                                'id': current_tool_use['id'],
+                                'name': current_tool_use['name'],
+                                'input': current_tool_use['input']
+                            })
+                            current_tool_use = None
+
+                    elif chunk['type'] == 'message_delta':
+                        stop_reason = chunk.get('delta', {}).get('stop_reason')
+
+                # Build content for history
+                content = []
+                if full_response_text:
+                    content.append({'type': 'text', 'text': full_response_text})
+                content.extend(tool_uses)
+
+                if content:
+                    self.conversation_history.append({
+                        "role": "assistant",
+                        "content": content
+                    })
+
+                # Handle tool use if needed
+                if stop_reason == 'tool_use' and tool_executor and tool_uses:
+                    iterations += 1
+                    logger.info(f"Tool use iteration {iterations}/{max_tool_iterations}")
+
+                    # Execute tools
+                    tool_results = []
+                    for tool_use in tool_uses:
+                        tool_name = tool_use.get("name")
+                        tool_input = tool_use.get("input", {})
+                        tool_use_id = tool_use.get("id")
+
+                        logger.info(f"Executing tool: {tool_name}")
+                        yield f"\n\n*Calling {tool_name}...*\n\n"
+
+                        try:
+                            result = tool_executor.execute(tool_name, tool_input)
+                            result_json = json.dumps(result, cls=DateTimeEncoder)
+                            if not result_json or result_json == "null":
+                                result_json = json.dumps({"message": "No data found"})
+                            tool_results.append({
+                                "type": "tool_result",
+                                "tool_use_id": tool_use_id,
+                                "content": result_json
+                            })
+                        except Exception as e:
+                            logger.error(f"Tool execution failed: {e}")
+                            tool_results.append({
+                                "type": "tool_result",
+                                "tool_use_id": tool_use_id,
+                                "content": json.dumps({"error": str(e)})
+                            })
+
+                    # Add tool results to history
+                    self.conversation_history.append({
+                        "role": "user",
+                        "content": tool_results
+                    })
+
+                    # Prepare next request
+                    request_body["messages"] = self.conversation_history
+                else:
+                    # No more tool calls, we're done
+                    break
+
+            except Exception as e:
+                logger.error(f"Streaming error: {e}")
+                yield f"\n\nError: {str(e)}"
+                break
+
+        if iterations >= max_tool_iterations:
+            logger.warning(f"Reached max tool iterations ({max_tool_iterations})")
+
     def clear_history(self):
         """Clear conversation history."""
         self.conversation_history = []
