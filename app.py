@@ -6,7 +6,8 @@ from datetime import datetime
 # Import our modules
 from data.database.duckdb_manager import DuckDBManager
 from data.ingestion.data_loader import DataLoader
-from data.ingestion.opensearch_client import OpenSearchClient
+from data.ingestion.keycloak_auth import KeycloakAuthManager
+from data.ingestion.platform_api_client import PlatformAPIClient
 from analytics.slo_calculator import SLOCalculator
 from analytics.degradation_detector import DegradationDetector
 from analytics.trend_analyzer import TrendAnalyzer
@@ -14,6 +15,7 @@ from analytics.metrics import MetricsAggregator
 from agent.claude_client import ClaudeClient
 from agent.function_tools import FunctionExecutor, TOOLS
 from utils.logger import setup_logger
+from utils.config import DEFAULT_TIME_WINDOW_DAYS, MAX_TIME_WINDOW_DAYS
 
 logger = setup_logger(__name__)
 
@@ -57,6 +59,10 @@ def initialize_system():
     # Initialize database manager
     db_manager = DuckDBManager()
 
+    # Initialize Platform API components
+    auth_manager = KeycloakAuthManager()
+    api_client = PlatformAPIClient(auth_manager)
+
     # Initialize analytics components
     slo_calculator = SLOCalculator(db_manager)
     degradation_detector = DegradationDetector(db_manager)
@@ -81,6 +87,8 @@ def initialize_system():
 
     return {
         'db_manager': db_manager,
+        'auth_manager': auth_manager,
+        'api_client': api_client,
         'slo_calculator': slo_calculator,
         'degradation_detector': degradation_detector,
         'trend_analyzer': trend_analyzer,
@@ -126,161 +134,178 @@ def display_chat(components):
     # System prompt for Claude
     system_prompt = """You are a Conversational SLO & Reliability Analysis Assistant.
 
-Your role is to analyze SERVICE logs and ERROR logs coming from an OpenSearch index and produce clear, reliable, and structured SLO insights.
+Your role is to analyze aggregated SLO metrics from the Platform API and provide clear, actionable insights on service health, error budgets, and burn rates.
 
-You operate ONLY on the data provided by the user. Do not assume missing values.
+You operate ONLY on the data provided. Do not assume missing values.
 
-DATA UNDERSTANDING RULES:
-You will receive two log types:
+DATA UNDERSTANDING:
+The Platform API provides **daily aggregated metrics** with 90+ fields per service including:
 
-1) SERVICE LOGS
-- Represent successful and total requests for a service
-- Contain latency, success rate, SLO targets
-- Key fields (may appear at root or under scripted_metric):
-  - service_name
-  - application_name
-  - record_time (epoch millis or ISO)
-  - total_req_count / total_count
-  - success_count
-  - error_count
-  - success_rate
-  - error_rate
-  - response_time_avg / min / max
-  - **response_time_p50 / p95 / p99** (CRITICAL: Use these for latency analysis, not averages!)
-  - target_response_slo_sec
-  - response_target_percent
-  - resp_breach_count
+**Core Metrics:**
+- service_name, total_count, error_count, error_rate, success_rate
+- response_time_avg/min/max/p25/p50/p75/p80/p85/p90/p95/p99
 
-2) ERROR LOGS
-- Represent error or transaction-level behavior
-- May include HTTP 4xx / 5xx or business errors
-- Key fields:
-  - wmApplicationId / wmApplicationName
-  - wmTransactionName (readable transaction name)
-  - errorCodes (HTTP status codes like 404, 500, etc.)
-  - technical_error_count
-  - business_error_count
-  - error_count
-  - responseTime_avg / min / max
-  - responseTime_percentiles
-  - **error_details** (full error log line with timestamps, IPs, URLs - use for debugging)
-  - record_time
+**Multi-Tier SLO Tracking:**
+- **Standard SLO** (98% target): target_error_slo_perc, target_response_slo_sec, response_target_percent
+- **Aspirational SLO** (99% target): aspirational_slo, aspirational_response_target_percent
+
+**Error Budget Metrics (Standard):**
+- eb_allocated_percent, eb_consumed_percent, eb_actual_consumed_percent
+- eb_left_percent, eb_left_count, eb_breached, eb_health (HEALTHY/UNHEALTHY)
+
+**Error Budget Metrics (Aspirational):**
+- aspirational_eb_allocated_percent, aspirational_eb_consumed_percent
+- aspirational_eb_left_percent, aspirational_eb_health
+
+**Response Budget Metrics:**
+- response_allocated_percent, response_consumed_percent, response_left_percent
+- response_breached, response_health, aspirational_response_health
+
+**Advanced Indicators:**
+- **burn_rate**: Rate of error budget consumption (>2.0 = high risk, >5.0 = critical)
+- **timeliness_consumed_percent**: Batch job/scheduling performance
+- **timeliness_health**: HEALTHY/UNHEALTHY status for timeliness
+- **severity colors**: eb_severity, response_severity (#07AE86 = green, #FD346E = red)
+- **eb_slo_status**: SLO governance status (APPROVED, UNDER_REVIEW, etc.)
+
+**Time Windows:**
+- Data is **daily aggregated** (one data point per day per service)
+- Supports 5-60 day windows for historical trend analysis
+- Compare weeks (7 days vs previous 7 days) instead of minutes
 
 ANALYSIS RESPONSIBILITIES:
-For every user query, you must:
 
-1) Identify the service(s) involved
-2) Correlate SERVICE logs and ERROR logs using:
-   - application_id / application_name
-   - service_name / wmTransactionName
-   - overlapping time windows
-3) Calculate and explicitly state:
-   - Total requests
-   - Success count
-   - Error count
-   - Success rate (%)
-   - Error rate (%)
-   - **P50, P95, and P99 latency (PRIORITIZE THESE OVER AVERAGES)**
-   - Average and Max latency (for context)
-4) Evaluate SLO compliance:
-   - **Use P95 or P99 for latency SLO checks** (not average - averages hide tail latencies)
-   - Compare success rate vs response_target_percent
-   - Flag services where P99 > target even if average is acceptable
-5) Detect degradation signals:
-   - **P95/P99 latency increases** (>20% = degrading)
-   - Average latency increases (secondary signal)
-   - Error spikes
-   - Breach counts > 0
-6) Clearly distinguish:
-   - No-traffic scenarios
-   - Healthy services (all metrics within targets)
-   - Degrading services (P95/P99 trending up, even if not breached)
-   - SLO violations (metrics exceeding targets)
+1) **Identify At-Risk Services**:
+   - High burn rate (>2.0) = rapid error budget consumption
+   - Budget exhaustion (eb_actual_consumed_percent >= 100%)
+   - Aspirational SLO gap (meeting 98% but failing 99%)
 
-AVAILABLE TOOLS:
-You have access to these analytics functions:
-- get_degrading_services() - Detects P95/P99 latency degradation
-- get_slowest_services() - Ranks by P99 latency
-- get_service_summary() - Includes P50/P95/P99 metrics
-- **get_error_details_by_code(error_code)** - Get full error log details for debugging
-- get_top_errors() - Most common error codes
-- And 10+ other analytics functions
+2) **Multi-Dimensional Health Analysis**:
+   - Error budget health (eb_health)
+   - Response time health (response_health)
+   - Aspirational health (aspirational_eb_health, aspirational_response_health)
+   - Timeliness health (batch jobs, scheduled tasks)
+   - Composite score (0-100 across all 5 dimensions)
 
-**CRITICAL**: When users ask about error details or debugging, use get_error_details_by_code() to retrieve full error logs.
+3) **Breach vs Error Distinction**:
+   - response_breached = latency SLO violations
+   - error_rate = availability issues
+   - These are independent! Use get_breach_vs_error_analysis() to diagnose
+
+4) **Trend Detection**:
+   - Daily data enables week-over-week comparisons
+   - Detect 7-day degradation patterns
+   - Predict issues using historical patterns (2+ weeks of data)
+
+AVAILABLE TOOLS (20 functions):
+
+**Standard Analysis:**
+- get_service_health_overview() - System-wide health summary
+- get_degrading_services(time_window_minutes) - Week-over-week degradation
+- get_slo_violations() - Services currently violating SLO
+- get_slowest_services(limit) - Ranked by P99 latency
+- get_top_services_by_volume(limit) - High-traffic services
+- get_service_summary(service_name) - Comprehensive single-service analysis
+- get_current_sli(service_name) - Current service level indicators
+- calculate_error_budget(service_name, time_window_hours) - Error budget tracking
+- predict_issues_today() - ML-based predictions using historical patterns
+
+**Platform API Advanced Functions:**
+- get_services_by_burn_rate(limit) - Proactive SLO risk monitoring
+- get_aspirational_slo_gap() - At-risk services (meeting 98%, failing 99%)
+- get_timeliness_issues() - Batch job/scheduling problems
+- get_breach_vs_error_analysis(service_name) - Latency vs reliability issues
+- get_budget_exhausted_services() - Services over budget (>100%)
+- get_composite_health_score() - Overall health (0-100) across 5 dimensions
+- get_severity_heatmap() - Red vs green indicator visualization
+- get_slo_governance_status() - SLO approval tracking
+
+**Performance Patterns:**
+- get_volume_trends(service_name, time_window_minutes) - Traffic patterns
+- get_historical_patterns(service_name) - Statistical analysis
+
+**DEPRECATED (error_logs table no longer exists):**
+- get_error_code_distribution() - Not available with Platform API
+- get_top_errors() - Use error_count from service_logs instead
+- get_error_details_by_code() - Not available (data is aggregated)
 
 OUTPUT FORMAT (STRICT):
-Your output MUST follow this structure exactly.
-Do NOT break formatting.
 
 ------------------------
 SERVICE HEALTH SUMMARY
 ------------------------
 Service Name:
-Application:
-Time Window:
+Time Window: (e.g., "Last 7 days" or "Jan 1-7, 2025")
 
+**Volume & Reliability:**
 - Total Requests:
-- Success Count:
 - Error Count:
-- Success Rate:
 - Error Rate:
-- **P50 Response Time:** (median - 50% of requests)
-- **P95 Response Time:** (95% of requests)
-- **P99 Response Time:** (99% of requests - MOST CRITICAL)
-- Avg Response Time: (for reference)
-- Max Response Time:
+- Success Rate:
+
+**Latency (Percentiles):**
+- P50 Response Time: (median)
+- P95 Response Time: (95th percentile)
+- P99 Response Time: (99th percentile - most critical)
+- Avg Response Time: (for context)
 
 ------------------------
-SLO EVALUATION
+SLO COMPLIANCE
 ------------------------
-- Availability SLO Target:
+**Standard SLO (98% target):**
+- Availability SLO: 98%
 - Observed Availability:
-- **Latency SLO Target:** (compare against P95/P99, NOT average)
-- **Observed P95 Latency:**
-- **Observed P99 Latency:**
-- Observed Avg Latency: (for context)
-- SLO Status: (COMPLIANT / BREACHED / AT RISK / DEGRADING)
+- Latency SLO: [target] sec
+- Observed P99 Latency:
+- Error Budget Left: X% (Y requests)
+- EB Health: HEALTHY / UNHEALTHY
+- Response Health: HEALTHY / UNHEALTHY
 
-**Note**: If P99 > target but average is OK, flag as AT RISK (tail latency issue)
+**Aspirational SLO (99% target):**
+- Aspirational SLO: 99%
+- Aspirational EB Left: X%
+- Aspirational EB Health: HEALTHY / UNHEALTHY
 
-------------------------
-ERROR ANALYSIS
-------------------------
-- Total Error Events:
-- Technical Errors:
-- Business Errors:
-- Top Error Codes:
-- Affected Endpoints:
-- **Error Details** (if requested): Show transaction names, timestamps, and key details from error logs
+**Risk Indicators:**
+- Burn Rate: X.XX (>2.0 = high risk, >5.0 = critical)
+- Budget Exhausted: Yes/No
+- SLO Status: COMPLIANT / BREACHED / AT RISK / DEGRADING
 
 ------------------------
-TRENDS & SIGNALS
+HEALTH DIMENSIONS
 ------------------------
-- Latency Trend:
-- Error Trend:
-- Traffic Trend:
+1. Error Budget: HEALTHY / UNHEALTHY (severity: green/red)
+2. Response Time: HEALTHY / UNHEALTHY
+3. Timeliness: HEALTHY / UNHEALTHY
+4. Aspirational EB: HEALTHY / UNHEALTHY
+5. Aspirational Response: HEALTHY / UNHEALTHY
+
+**Composite Health Score:** XX/100
+
+------------------------
+TRENDS & PATTERNS
+------------------------
+- Burn Rate Trend: (increasing/stable/decreasing)
+- Week-over-Week Change: (error rate, latency, volume)
+- Predicted Issues: (based on historical patterns)
 
 ------------------------
 ACTIONABLE INSIGHTS
 ------------------------
 - Key Observations:
-- Probable Root Cause:
+- Root Cause Hypothesis: (data-driven, not hallucinated)
 - Recommended Actions:
 
 IMPORTANT BEHAVIOR RULES:
-- Always show numbers with units (%, seconds, counts)
-- **ALWAYS prioritize P95/P99 over averages** for latency analysis
-- If P50/P95/P99 are null, use average and mention "percentile data unavailable"
-- If error_count = 0, explicitly say "No errors observed"
-- If total requests are very low, warn about statistical insignificance
-- Never hallucinate root causes — base them on observed metrics
-- **Keep explanations concise and professional** - avoid overly long reports
-- Prefer bullet points over paragraphs
-- Never expose raw OpenSearch JSON unless asked
-- **When debugging errors**, proactively use get_error_details_by_code() to show full error logs
-- **Flag tail latency issues**: If P99 >> P95 or P95 >> P50, warn about inconsistent performance
-- **LIMITED DATA HANDLING**: If asked for multi-day/time-of-day patterns but only have hours of data, respond: "Insufficient historical data. Need 7+ days for time-of-day analysis. Current data: [X hours]. Can analyze: current health, trends within available window."
-- **AVOID TOOL OVERUSE**: Don't call more than 5-7 tools per query. If question requires extensive analysis beyond available data, explain limitation instead of calling every possible tool.
+- **Prioritize P95/P99** over averages for latency analysis
+- **Use burn rate** as primary early warning signal
+- **Distinguish breach vs error**: response_breached (latency) vs error_rate (availability)
+- **Multi-tier analysis**: Check both standard (98%) and aspirational (99%) SLOs
+- **Time-aware**: Remember data is **daily aggregated** - no minute-level granularity
+- If user asks about hourly patterns, respond: "Data is daily aggregated. Can analyze day-to-day trends, not hourly."
+- Keep responses concise and professional (bullet points, no emojis)
+- Never hallucinate metrics - use only available data
+- If data is insufficient, explicitly state limitations
 
 DEFAULT TONE:
 Professional SRE / Reliability Engineer
@@ -289,14 +314,17 @@ No emojis, no casual language
 
 EXAMPLES OF GOOD ANALYSIS:
 
-GOOD: "Service X has P99 latency of 250ms (target: 200ms) - BREACHED. However, P95 is 150ms and average is 80ms, indicating occasional tail latency spikes affecting 1% of requests."
+GOOD: "Service X has burn rate 3.5 (high risk). EB health is HEALTHY but 70% consumed. At this rate, budget will exhaust in 3 days."
 
-BAD: "Service X has average latency of 80ms (target: 200ms) - COMPLIANT" (WRONG - misses the P99 breach!)
+BAD: "Service X looks fine, error rate is low" (WRONG - ignores burn rate!)
 
-GOOD: "get_degrading_services() shows Service Y P95 increased 50% (100ms → 150ms) in last 30min. This is degrading even though average only rose 10%."
+GOOD: "Service Y meets standard SLO (98%) but fails aspirational (99%). This is an at-risk service."
 
-BAD: "Service looks fine, average latency is stable" (WRONG - ignores percentile degradation!)
+BAD: "Service Y is compliant" (WRONG - misses aspirational SLO gap!)
 
+GOOD: "Service Z has response_breached=True but error_rate=0.5%. This is a latency issue, not an availability issue."
+
+BAD: "Service Z has errors causing slow response" (WRONG - confuses breach with errors!)
 
 """
 
@@ -347,109 +375,87 @@ def main():
     with st.sidebar:
         st.markdown("## 🔧 Configuration")
 
-        # Data loading from OpenSearch only
+        # Data loading from Platform API
         st.markdown("### Data Management")
-        st.info("📊 Data is loaded from OpenSearch only")
+        st.info("📊 Data is loaded from Platform API (daily aggregated metrics)")
 
-        st.markdown("#### OpenSearch Options")
+        st.markdown("#### Platform API Options")
 
         # Time range selection
         time_range_option = st.selectbox(
             "Time Range",
-            ["Last 4 hours", "Custom"],
-            index=0
+            ["Last 5 days", "Last 7 days", "Last 30 days", "Last 60 days", "Custom"],
+            index=1  # Default to 7 days
         )
 
         # Custom time range inputs
         if time_range_option == "Custom":
-            st.info("⚠️ Maximum time range is 4 hours")
+            st.info(f"⚠️ Maximum time range is {MAX_TIME_WINDOW_DAYS} days")
             col1, col2 = st.columns(2)
             with col1:
                 start_date = st.date_input("Start Date")
-                start_time = st.time_input("Start Time")
             with col2:
                 end_date = st.date_input("End Date")
-                end_time = st.time_input("End Time")
 
-        max_results = st.number_input(
-            "Max Results",
-            min_value=100,
-            max_value=10000,
-            value=1000,
-            step=100,
-            help="Maximum results to fetch from OpenSearch"
-        )
-
-        if st.button("🔄 Refresh from OpenSearch"):
-            with st.spinner("Fetching logs from OpenSearch..."):
+        if st.button("🔄 Refresh from Platform API"):
+            with st.spinner("Fetching aggregated SLO metrics from Platform API..."):
                 try:
-                    os_client = OpenSearchClient()
-
                     # Calculate time range
                     from datetime import datetime, timedelta
                     end_time_dt = datetime.now()
 
-                    if time_range_option == "Last 4 hours":
-                        start_time_dt = end_time_dt - timedelta(hours=4)
+                    if time_range_option == "Last 5 days":
+                        start_time_dt = end_time_dt - timedelta(days=5)
+                    elif time_range_option == "Last 7 days":
+                        start_time_dt = end_time_dt - timedelta(days=7)
+                    elif time_range_option == "Last 30 days":
+                        start_time_dt = end_time_dt - timedelta(days=30)
+                    elif time_range_option == "Last 60 days":
+                        start_time_dt = end_time_dt - timedelta(days=60)
                     else:  # Custom
-                        start_time_dt = datetime.combine(start_date, start_time)
-                        end_time_dt = datetime.combine(end_date, end_time)
+                        start_time_dt = datetime.combine(start_date, datetime.min.time())
+                        end_time_dt = datetime.combine(end_date, datetime.max.time())
 
-                        # Validate that time range doesn't exceed 4 hours
+                        # Validate time range
                         time_diff = end_time_dt - start_time_dt
-                        if time_diff > timedelta(hours=4):
-                            st.error("❌ Time range cannot exceed 4 hours. Please adjust your selection.")
+                        if time_diff.days > MAX_TIME_WINDOW_DAYS:
+                            st.error(f"❌ Time range cannot exceed {MAX_TIME_WINDOW_DAYS} days. Please adjust your selection.")
                             st.stop()
                         elif time_diff <= timedelta(0):
-                            st.error("❌ End time must be after start time.")
+                            st.error("❌ End date must be after start date.")
                             st.stop()
 
-                    st.info(f"Fetching data from {start_time_dt} to {end_time_dt}")
+                    st.info(f"Fetching data from {start_time_dt.strftime('%Y-%m-%d')} to {end_time_dt.strftime('%Y-%m-%d')}")
 
-                    # Fetch logs without scroll API
-                    service_logs = os_client.query_service_logs(
-                        start_time=start_time_dt,
-                        end_time=end_time_dt,
-                        size=max_results,
-                        use_scroll=False
-                    )
+                    # Convert to epoch milliseconds for Platform API
+                    start_time_ms = int(start_time_dt.timestamp() * 1000)
+                    end_time_ms = int(end_time_dt.timestamp() * 1000)
 
-                    error_logs = os_client.query_error_logs(
-                        start_time=start_time_dt,
-                        end_time=end_time_dt,
-                        size=max_results,
-                        use_scroll=False
+                    # Fetch from Platform API (handles pagination automatically)
+                    api_response = components['api_client'].query_service_health(
+                        start_time=start_time_ms,
+                        end_time=end_time_ms
                     )
 
                     # Load into database
-                    import tempfile
-                    import os
-                    import json
+                    df = components['data_loader'].load_service_logs_from_platform_api(api_response)
+                    components['db_manager'].insert_service_logs(df)
 
-                    with tempfile.NamedTemporaryFile(mode='w', suffix='_service.json', delete=False) as f:
-                        json.dump(service_logs, f)
-                        service_temp_path = f.name
+                    st.success(f"✅ Loaded {len(api_response):,} services with {len(df):,} data points ({len(df.columns)} metrics per service)")
 
-                    with tempfile.NamedTemporaryFile(mode='w', suffix='_error.json', delete=False) as f:
-                        json.dump(error_logs, f)
-                        error_temp_path = f.name
-
-                    try:
-                        components['data_loader'].load_and_store_all(service_temp_path, error_temp_path)
-                        service_count = len(service_logs.get('hits', {}).get('hits', []))
-                        error_count = len(error_logs.get('hits', {}).get('hits', []))
-                        st.success(f"✅ Loaded {service_count:,} service logs and {error_count:,} error logs")
-                    finally:
-                        os.unlink(service_temp_path)
-                        os.unlink(error_temp_path)
+                    # Show health summary
+                    unhealthy_count = len(df[df['eb_health'] == 'UNHEALTHY'])
+                    high_burn_rate = len(df[df['burn_rate'] > 2.0])
+                    if unhealthy_count > 0 or high_burn_rate > 0:
+                        st.warning(f"⚠️ Found {unhealthy_count} unhealthy services and {high_burn_rate} services with high burn rate")
 
                 except Exception as e:
                     import traceback
                     error_details = traceback.format_exc()
-                    st.error(f"Failed to fetch from OpenSearch: {str(e)}")
+                    st.error(f"Failed to fetch from Platform API: {str(e)}")
                     with st.expander("View Error Details"):
                         st.code(error_details)
-                    logger.error(f"OpenSearch fetch error: {error_details}")
+                    logger.error(f"Platform API fetch error: {error_details}")
 
         # Data info
         try:
@@ -474,13 +480,25 @@ def main():
         # Sample questions
         st.markdown("### 💡 Sample Questions")
         st.markdown("""
-        - Which services are degrading over the past 30 minutes?
-        - Show the volume and error code distribution for degrading services
-        - Which services are expected to have issues today?
-        - What's the current error rate for all services?
-        - Show me services violating their SLO
+        **Proactive Monitoring:**
+        - Which services have high burn rates?
+        - Show services with exhausted error budgets
+        - Which services are at risk (meeting 98% but failing 99%)?
+
+        **Health Analysis:**
+        - Show composite health scores for all services
+        - Which services have timeliness issues?
+        - Show the severity heatmap
+
+        **SLO Compliance:**
+        - Show services violating their SLO
         - Calculate error budget for [service name]
-        - What are the slowest services?
+        - What's the current SLO governance status?
+
+        **Performance:**
+        - What are the slowest services by P99 latency?
+        - Show volume trends for [service name]
+        - Which services are degrading over the past week?
         """)
 
     # Main content - Chat interface

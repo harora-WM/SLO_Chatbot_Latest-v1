@@ -300,3 +300,359 @@ class MetricsAggregator:
             })
 
         return results
+
+    # ==================== NEW PLATFORM API FUNCTIONS ====================
+    # The following functions leverage the extended schema with burn rate,
+    # health indicators, aspirational SLO metrics, and timeliness tracking
+
+    def get_services_by_burn_rate(self, limit: int = 10) -> List[Dict[str, Any]]:
+        """Get services with highest SLO burn rates.
+
+        High burn rate indicates rapid error budget consumption and SLO breach risk.
+
+        Args:
+            limit: Number of services to return
+
+        Returns:
+            List of services sorted by burn rate (descending)
+        """
+        sql = f"""
+            SELECT
+                service_name,
+                AVG(burn_rate) as avg_burn_rate,
+                AVG(eb_actual_consumed_percent) as avg_eb_consumed,
+                AVG(eb_left_percent) as avg_eb_left,
+                AVG(error_rate) as avg_error_rate,
+                MAX(eb_health) as eb_health
+            FROM service_logs
+            GROUP BY service_name
+            HAVING avg_burn_rate > 0
+            ORDER BY avg_burn_rate DESC
+            LIMIT {limit}
+        """
+
+        df = self.db_manager.query(sql)
+
+        results = []
+        for _, row in df.iterrows():
+            results.append({
+                'service_name': row['service_name'],
+                'avg_burn_rate': row['avg_burn_rate'] if pd.notna(row['avg_burn_rate']) else 0.0,
+                'avg_eb_consumed': row['avg_eb_consumed'] if pd.notna(row['avg_eb_consumed']) else 0.0,
+                'avg_eb_left': row['avg_eb_left'] if pd.notna(row['avg_eb_left']) else 0.0,
+                'avg_error_rate': row['avg_error_rate'] if pd.notna(row['avg_error_rate']) else 0.0,
+                'eb_health': row['eb_health'] if pd.notna(row['eb_health']) else 'UNKNOWN'
+            })
+
+        return results
+
+    def get_aspirational_slo_gap(self) -> List[Dict[str, Any]]:
+        """Identify services meeting standard SLO (98%) but failing aspirational SLO (99%).
+
+        These are 'at risk' services - one incident away from standard SLO breach.
+
+        Returns:
+            List of services with aspirational SLO gaps
+        """
+        sql = """
+            SELECT
+                service_name,
+                eb_health,
+                aspirational_eb_health,
+                response_health,
+                aspirational_response_health,
+                AVG(eb_actual_consumed_percent) as std_eb_consumed,
+                AVG(aspirational_eb_actual_consumed_percent) as asp_eb_consumed,
+                AVG(burn_rate) as avg_burn_rate
+            FROM service_logs
+            WHERE (eb_health = 'HEALTHY' AND aspirational_eb_health = 'UNHEALTHY')
+               OR (response_health = 'HEALTHY' AND aspirational_response_health = 'UNHEALTHY')
+            GROUP BY service_name, eb_health, aspirational_eb_health,
+                     response_health, aspirational_response_health
+        """
+
+        df = self.db_manager.query(sql)
+
+        results = []
+        for _, row in df.iterrows():
+            results.append({
+                'service_name': row['service_name'],
+                'eb_health': row['eb_health'],
+                'aspirational_eb_health': row['aspirational_eb_health'],
+                'response_health': row['response_health'],
+                'aspirational_response_health': row['aspirational_response_health'],
+                'std_eb_consumed': row['std_eb_consumed'] if pd.notna(row['std_eb_consumed']) else 0.0,
+                'asp_eb_consumed': row['asp_eb_consumed'] if pd.notna(row['asp_eb_consumed']) else 0.0,
+                'avg_burn_rate': row['avg_burn_rate'] if pd.notna(row['avg_burn_rate']) else 0.0
+            })
+
+        return results
+
+    def get_timeliness_issues(self) -> List[Dict[str, Any]]:
+        """Find services with timeliness/scheduling problems.
+
+        Cross-correlates with response time to identify root cause (performance vs scheduling).
+
+        Returns:
+            List of services with timeliness issues
+        """
+        sql = """
+            SELECT
+                service_name,
+                timeliness_health,
+                response_health,
+                AVG(timeliness_consumed_percent) as avg_timeliness_consumed,
+                AVG(response_time_p95) as avg_p95,
+                AVG(error_rate) as avg_error_rate
+            FROM service_logs
+            WHERE timeliness_health = 'UNHEALTHY'
+            GROUP BY service_name, timeliness_health, response_health
+        """
+
+        df = self.db_manager.query(sql)
+
+        results = []
+        for _, row in df.iterrows():
+            results.append({
+                'service_name': row['service_name'],
+                'timeliness_health': row['timeliness_health'],
+                'response_health': row['response_health'],
+                'avg_timeliness_consumed': row['avg_timeliness_consumed'] if pd.notna(row['avg_timeliness_consumed']) else 0.0,
+                'avg_p95': row['avg_p95'] if pd.notna(row['avg_p95']) else 0.0,
+                'avg_error_rate': row['avg_error_rate'] if pd.notna(row['avg_error_rate']) else 0.0
+            })
+
+        return results
+
+    def get_breach_vs_error_analysis(self, service_name: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Compare response SLA breach rate vs actual error rate.
+
+        Identifies:
+        - High responseErrorRate + Low errorRate = Latency issues (slow but working)
+        - Low responseErrorRate + High errorRate = Reliability issues (fast but broken)
+
+        Args:
+            service_name: Specific service name (optional). If not provided, analyzes all services.
+
+        Returns:
+            List of services with breach vs error analysis
+        """
+        where_clause = f"WHERE service_name = '{service_name}'" if service_name else ""
+
+        sql = f"""
+            SELECT
+                service_name,
+                AVG(response_error_rate) as avg_breach_rate,
+                AVG(error_rate) as avg_error_rate,
+                AVG(response_breach_count) as avg_breach_count,
+                AVG(error_count) as avg_error_count,
+                AVG(response_time_p95) as avg_p95,
+                CASE
+                    WHEN AVG(response_error_rate) > AVG(error_rate) THEN 'LATENCY_ISSUE'
+                    WHEN AVG(error_rate) > AVG(response_error_rate) THEN 'RELIABILITY_ISSUE'
+                    ELSE 'BALANCED'
+                END as issue_type
+            FROM service_logs
+            {where_clause}
+            GROUP BY service_name
+            ORDER BY avg_breach_rate DESC
+        """
+
+        df = self.db_manager.query(sql)
+
+        results = []
+        for _, row in df.iterrows():
+            breach_count = row['avg_breach_count']
+            error_count = row['avg_error_count']
+            results.append({
+                'service_name': row['service_name'],
+                'avg_breach_rate': row['avg_breach_rate'] if pd.notna(row['avg_breach_rate']) else 0.0,
+                'avg_error_rate': row['avg_error_rate'] if pd.notna(row['avg_error_rate']) else 0.0,
+                'avg_breach_count': int(breach_count) if pd.notna(breach_count) else 0,
+                'avg_error_count': int(error_count) if pd.notna(error_count) else 0,
+                'avg_p95': row['avg_p95'] if pd.notna(row['avg_p95']) else 0.0,
+                'issue_type': row['issue_type']
+            })
+
+        return results
+
+    def get_budget_exhausted_services(self) -> List[Dict[str, Any]]:
+        """Get services that have fully exhausted their error budget.
+
+        Services with eb_actual_consumed_percent >= 100 or eb_left_count < 0
+        are over budget and need immediate attention.
+
+        Returns:
+            List of services with exhausted budgets
+        """
+        sql = """
+            SELECT
+                service_name,
+                eb_actual_consumed_percent,
+                eb_left_count,
+                aspirational_eb_actual_consumed_percent,
+                burn_rate,
+                eb_health,
+                AVG(error_rate) as avg_error_rate
+            FROM service_logs
+            WHERE eb_actual_consumed_percent >= 100 OR eb_left_count < 0
+            GROUP BY service_name, eb_actual_consumed_percent, eb_left_count,
+                     aspirational_eb_actual_consumed_percent, burn_rate, eb_health
+            ORDER BY eb_actual_consumed_percent DESC
+        """
+
+        df = self.db_manager.query(sql)
+
+        results = []
+        for _, row in df.iterrows():
+            eb_left = row['eb_left_count']
+            results.append({
+                'service_name': row['service_name'],
+                'eb_actual_consumed_percent': row['eb_actual_consumed_percent'] if pd.notna(row['eb_actual_consumed_percent']) else 0.0,
+                'eb_left_count': int(eb_left) if pd.notna(eb_left) else 0,
+                'aspirational_eb_actual_consumed_percent': row['aspirational_eb_actual_consumed_percent'] if pd.notna(row['aspirational_eb_actual_consumed_percent']) else 0.0,
+                'burn_rate': row['burn_rate'] if pd.notna(row['burn_rate']) else 0.0,
+                'eb_health': row['eb_health'] if pd.notna(row['eb_health']) else 'UNKNOWN',
+                'avg_error_rate': row['avg_error_rate'] if pd.notna(row['avg_error_rate']) else 0.0
+            })
+
+        return results
+
+    def get_composite_health_score(self) -> List[Dict[str, Any]]:
+        """Calculate overall health score across all dimensions.
+
+        Aggregates: error budget, response time, timeliness, aspirational error budget,
+        and aspirational response health.
+
+        Returns:
+            List of services with composite health scores (0-100)
+        """
+        sql = """
+            SELECT
+                service_name,
+                -- Count healthy dimensions (0-5)
+                (CASE WHEN eb_health = 'HEALTHY' THEN 1 ELSE 0 END +
+                 CASE WHEN response_health = 'HEALTHY' THEN 1 ELSE 0 END +
+                 CASE WHEN timeliness_health = 'HEALTHY' THEN 1 ELSE 0 END +
+                 CASE WHEN aspirational_eb_health = 'HEALTHY' THEN 1 ELSE 0 END +
+                 CASE WHEN aspirational_response_health = 'HEALTHY' THEN 1 ELSE 0 END) as healthy_dimensions,
+                eb_health,
+                response_health,
+                timeliness_health,
+                aspirational_eb_health,
+                aspirational_response_health,
+                AVG(burn_rate) as avg_burn_rate
+            FROM service_logs
+            GROUP BY service_name, eb_health, response_health, timeliness_health,
+                     aspirational_eb_health, aspirational_response_health
+            ORDER BY healthy_dimensions ASC, avg_burn_rate DESC
+        """
+
+        df = self.db_manager.query(sql)
+
+        results = []
+        for _, row in df.iterrows():
+            healthy_dims = row['healthy_dimensions']
+            health_score = (healthy_dims / 5.0) * 100 if pd.notna(healthy_dims) else 0.0
+
+            results.append({
+                'service_name': row['service_name'],
+                'healthy_dimensions': int(healthy_dims) if pd.notna(healthy_dims) else 0,
+                'health_score': health_score,
+                'eb_health': row['eb_health'],
+                'response_health': row['response_health'],
+                'timeliness_health': row['timeliness_health'],
+                'aspirational_eb_health': row['aspirational_eb_health'],
+                'aspirational_response_health': row['aspirational_response_health'],
+                'avg_burn_rate': row['avg_burn_rate'] if pd.notna(row['avg_burn_rate']) else 0.0
+            })
+
+        return results
+
+    def get_severity_heatmap(self) -> List[Dict[str, Any]]:
+        """Visual representation of severity across all dimensions.
+
+        Counts red (#FD346E) vs green (#07AE86) health indicators per service
+        to identify services with multiple unhealthy dimensions.
+
+        Returns:
+            List of services with severity counts
+        """
+        sql = """
+            SELECT
+                service_name,
+                -- Count red indicators (#FD346E)
+                (CASE WHEN response_severity = '#FD346E' THEN 1 ELSE 0 END +
+                 CASE WHEN eb_severity = '#FD346E' THEN 1 ELSE 0 END +
+                 CASE WHEN timeliness_severity = '#FD346E' THEN 1 ELSE 0 END +
+                 CASE WHEN aspirational_response_severity = '#FD346E' THEN 1 ELSE 0 END +
+                 CASE WHEN aspirational_eb_severity = '#FD346E' THEN 1 ELSE 0 END) as red_count,
+                -- Count green indicators (#07AE86)
+                (CASE WHEN response_severity = '#07AE86' THEN 1 ELSE 0 END +
+                 CASE WHEN eb_severity = '#07AE86' THEN 1 ELSE 0 END +
+                 CASE WHEN timeliness_severity = '#07AE86' THEN 1 ELSE 0 END +
+                 CASE WHEN aspirational_response_severity = '#07AE86' THEN 1 ELSE 0 END +
+                 CASE WHEN aspirational_eb_severity = '#07AE86' THEN 1 ELSE 0 END) as green_count,
+                response_severity,
+                eb_severity,
+                timeliness_severity,
+                AVG(burn_rate) as avg_burn_rate
+            FROM service_logs
+            GROUP BY service_name, response_severity, eb_severity, timeliness_severity,
+                     aspirational_response_severity, aspirational_eb_severity
+            ORDER BY red_count DESC, avg_burn_rate DESC
+        """
+
+        df = self.db_manager.query(sql)
+
+        results = []
+        for _, row in df.iterrows():
+            red_cnt = row['red_count']
+            green_cnt = row['green_count']
+            results.append({
+                'service_name': row['service_name'],
+                'red_count': int(red_cnt) if pd.notna(red_cnt) else 0,
+                'green_count': int(green_cnt) if pd.notna(green_cnt) else 0,
+                'response_severity': row['response_severity'],
+                'eb_severity': row['eb_severity'],
+                'timeliness_severity': row['timeliness_severity'],
+                'avg_burn_rate': row['avg_burn_rate'] if pd.notna(row['avg_burn_rate']) else 0.0
+            })
+
+        return results
+
+    def get_slo_governance_status(self) -> List[Dict[str, Any]]:
+        """Track services by SLO approval status.
+
+        Identifies services with SLOs under review or not yet approved,
+        helping prioritize SLO governance workflow.
+
+        Returns:
+            List of services needing SLO governance attention
+        """
+        sql = """
+            SELECT
+                service_name,
+                eb_slo_status,
+                AVG(burn_rate) as avg_burn_rate,
+                eb_health,
+                response_health
+            FROM service_logs
+            WHERE eb_slo_status = 'UNDER_REVIEW'
+            GROUP BY service_name, eb_slo_status, eb_health, response_health
+            ORDER BY avg_burn_rate DESC
+        """
+
+        df = self.db_manager.query(sql)
+
+        results = []
+        for _, row in df.iterrows():
+            results.append({
+                'service_name': row['service_name'],
+                'eb_slo_status': row['eb_slo_status'],
+                'avg_burn_rate': row['avg_burn_rate'] if pd.notna(row['avg_burn_rate']) else 0.0,
+                'eb_health': row['eb_health'] if pd.notna(row['eb_health']) else 'UNKNOWN',
+                'response_health': row['response_health'] if pd.notna(row['response_health']) else 'UNKNOWN'
+            })
+
+        return results

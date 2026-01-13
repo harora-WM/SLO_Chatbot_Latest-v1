@@ -43,21 +43,35 @@ class FunctionExecutor:
             Function result
         """
         function_map = {
+            # Standard Performance & Health (6 functions)
             "get_degrading_services": self._get_degrading_services,
-            "get_error_code_distribution": self._get_error_code_distribution,
             "get_current_sli": self._get_current_sli,
-            "predict_issues_today": self._predict_issues_today,
-            "get_service_summary": self._get_service_summary,
             "get_slo_violations": self._get_slo_violations,
-            "calculate_error_budget": self._calculate_error_budget,
-            "get_volume_trends": self._get_volume_trends,
             "get_service_health_overview": self._get_service_health_overview,
             "get_top_services_by_volume": self._get_top_services_by_volume,
             "get_slowest_services": self._get_slowest_services,
             "get_error_prone_services": self._get_error_prone_services,
-            "get_top_errors": self._get_top_errors,
-            "get_error_details_by_code": self._get_error_details_by_code,
-            "get_historical_patterns": self._get_historical_patterns
+
+            # SLO & Budget Tracking (2 functions)
+            "calculate_error_budget": self._calculate_error_budget,
+            "get_service_summary": self._get_service_summary,
+
+            # Trend Analysis (3 functions)
+            "predict_issues_today": self._predict_issues_today,
+            "get_volume_trends": self._get_volume_trends,
+            "get_historical_patterns": self._get_historical_patterns,
+
+            # NEW: Platform API Functions (8 functions)
+            "get_services_by_burn_rate": self._get_services_by_burn_rate,
+            "get_aspirational_slo_gap": self._get_aspirational_slo_gap,
+            "get_timeliness_issues": self._get_timeliness_issues,
+            "get_breach_vs_error_analysis": self._get_breach_vs_error_analysis,
+            "get_budget_exhausted_services": self._get_budget_exhausted_services,
+            "get_composite_health_score": self._get_composite_health_score,
+            "get_severity_heatmap": self._get_severity_heatmap,
+            "get_slo_governance_status": self._get_slo_governance_status,
+
+            # Total: 20 functions
         }
 
         if function_name not in function_map:
@@ -135,6 +149,48 @@ class FunctionExecutor:
     def _get_historical_patterns(self, service_name: str) -> Dict[str, Any]:
         """Get historical patterns for service."""
         return self.trend_analyzer.get_historical_patterns(service_name)
+
+    # ==================== NEW PLATFORM API WRAPPER FUNCTIONS ====================
+
+    def _get_services_by_burn_rate(self, limit: int = 10) -> Dict[str, Any]:
+        """Get services with highest burn rates."""
+        result = self.metrics_aggregator.get_services_by_burn_rate(limit)
+        return {"services": result, "count": len(result)}
+
+    def _get_aspirational_slo_gap(self) -> Dict[str, Any]:
+        """Get services with aspirational SLO gaps (meeting 98% but failing 99%)."""
+        result = self.metrics_aggregator.get_aspirational_slo_gap()
+        return {"services": result, "count": len(result)}
+
+    def _get_timeliness_issues(self) -> Dict[str, Any]:
+        """Get services with timeliness/scheduling problems."""
+        result = self.metrics_aggregator.get_timeliness_issues()
+        return {"services": result, "count": len(result)}
+
+    def _get_breach_vs_error_analysis(self, service_name: str = None) -> Dict[str, Any]:
+        """Compare breach rate vs error rate to identify latency or reliability issues."""
+        result = self.metrics_aggregator.get_breach_vs_error_analysis(service_name)
+        return {"services": result, "count": len(result)}
+
+    def _get_budget_exhausted_services(self) -> Dict[str, Any]:
+        """Get services with exhausted error budgets (>=100% consumed)."""
+        result = self.metrics_aggregator.get_budget_exhausted_services()
+        return {"services": result, "count": len(result)}
+
+    def _get_composite_health_score(self) -> Dict[str, Any]:
+        """Get composite health scores across all dimensions (0-100)."""
+        result = self.metrics_aggregator.get_composite_health_score()
+        return {"services": result, "count": len(result)}
+
+    def _get_severity_heatmap(self) -> Dict[str, Any]:
+        """Get severity heatmap showing red vs green indicators per service."""
+        result = self.metrics_aggregator.get_severity_heatmap()
+        return {"services": result, "count": len(result)}
+
+    def _get_slo_governance_status(self) -> Dict[str, Any]:
+        """Get services with SLOs under review or not yet approved."""
+        result = self.metrics_aggregator.get_slo_governance_status()
+        return {"services": result, "count": len(result)}
 
 
 # Tool definitions for Claude
@@ -347,6 +403,82 @@ TOOLS = [
                 }
             },
             "required": ["service_name"]
+        }
+    },
+    # ==================== NEW PLATFORM API TOOLS (8 functions) ====================
+    {
+        "name": "get_services_by_burn_rate",
+        "description": "Get services with highest SLO burn rates. High burn rate (>2.0) indicates rapid error budget consumption and imminent SLO breach risk. Use this for proactive monitoring.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "limit": {
+                    "type": "integer",
+                    "description": "Maximum number of services to return (default: 10)",
+                    "default": 10
+                }
+            }
+        }
+    },
+    {
+        "name": "get_aspirational_slo_gap",
+        "description": "Identify services meeting standard SLO (98%) but failing aspirational SLO (99%). These are 'at risk' services - one incident away from standard SLO breach. Use this to identify early warning signs.",
+        "input_schema": {
+            "type": "object",
+            "properties": {}
+        }
+    },
+    {
+        "name": "get_timeliness_issues",
+        "description": "Find services with timeliness/scheduling problems (batch jobs not completing on time, etc.). Cross-correlates with response time to identify root cause - performance vs scheduling issues.",
+        "input_schema": {
+            "type": "object",
+            "properties": {}
+        }
+    },
+    {
+        "name": "get_breach_vs_error_analysis",
+        "description": "Compare response SLA breach rate vs actual error rate to identify the root cause. High breach + Low error = Latency issues (slow but working). Low breach + High error = Reliability issues (fast but broken).",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "service_name": {
+                    "type": "string",
+                    "description": "Specific service name (optional). If not provided, analyzes all services."
+                }
+            }
+        }
+    },
+    {
+        "name": "get_budget_exhausted_services",
+        "description": "Get services that have fully exhausted their error budget (>=100% consumed or negative remaining). These services are over budget and need immediate attention to avoid SLO violations.",
+        "input_schema": {
+            "type": "object",
+            "properties": {}
+        }
+    },
+    {
+        "name": "get_composite_health_score",
+        "description": "Calculate overall health score (0-100) across all dimensions: error budget, response time, timeliness, aspirational error budget, and aspirational response health. Returns breakdown by dimension.",
+        "input_schema": {
+            "type": "object",
+            "properties": {}
+        }
+    },
+    {
+        "name": "get_severity_heatmap",
+        "description": "Visual representation of severity across all dimensions. Counts red (#FD346E) vs green (#07AE86) health indicators per service to identify services with multiple unhealthy dimensions requiring urgent attention.",
+        "input_schema": {
+            "type": "object",
+            "properties": {}
+        }
+    },
+    {
+        "name": "get_slo_governance_status",
+        "description": "Track services by SLO approval status. Identifies services with SLOs under review or not yet approved, helping prioritize SLO governance workflow and ensure all services have validated SLO targets.",
+        "input_schema": {
+            "type": "object",
+            "properties": {}
         }
     }
 ]

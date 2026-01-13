@@ -2,58 +2,75 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Overview
+
+**SLO Chatbot** - AI-powered Service Level Objective monitoring using Claude Sonnet 4.5 via AWS Bedrock. Analyzes **daily aggregated SLO metrics from the WM Platform Error Budget Statistics Service API** with **20 analytics functions**.
+
+**Latest Update (January 2026):** Migrated from OpenSearch to Platform API (90+ metrics, unlimited pagination, 5-60 day windows).
+
+## Additional Documentation
+
+- **PLATFORM_API_MIGRATION.md** - Complete migration guide (600+ lines)
+- **README.md** - Main project documentation
+- **DEPRECATED.md** - Deprecated files and migration paths
+
 ## Quick Start
 
 ```bash
 # First-time setup
+python3 -m venv venv
+source venv/bin/activate  # On Windows: venv\Scripts\activate
 pip install -r requirements.txt
-cp .env.example .env  # Then edit .env with your credentials
+cp .env.example .env  # Then edit .env with your Keycloak credentials
 
 # Run the application
 streamlit run app.py
-# Note: Data is loaded from OpenSearch only via the UI
 
-# Run tests (uses local JSON files for testing)
-python test_system.py
+# Run Platform API tests (requires valid Keycloak credentials in .env)
+python test_platform_api.py
+
+# Test Keycloak authentication separately
+python test_keycloak_auth.py
 
 # Inspect database contents
 python check_data.py
 
-# Debug OpenSearch connection
-python debug_opensearch.py
+# Legacy test suite (uses local JSON files, not Platform API)
+python test_system.py
 ```
 
-## Architecture Overview
+## Architecture
 
-This is a conversational SLO (Service Level Objective) chatbot using **Claude Sonnet 4.5 via AWS Bedrock**. The system analyzes service and error logs using a **function calling architecture** where Claude has access to 15 analytics functions.
-
-### Core Data Flow
-
+### Data Flow
 ```
-OpenSearch → DataLoader → DuckDB → Analytics Functions → Claude → User
+Platform API → Keycloak OAuth2 → PlatformAPIClient (Pagination) → DataLoader → DuckDB (90+ cols) → Analytics → Claude → User
 ```
 
-**Critical architectural decision**: This system uses **DuckDB (OLAP)** instead of vector databases because SLO data is highly structured with time-series metrics (error_rate, response_time, request_count). Structured data benefits from SQL aggregations, not semantic search.
+### Key Architectural Decisions
+1. **DuckDB (OLAP)** - SLO data is structured time-series. No vector DB needed - SQL aggregations are faster and more precise.
+2. **Daily aggregation** - Better for long-term trends (5-60 days) vs hourly (4-hour windows)
+3. **Keycloak OAuth2** - Background token refresh every 4 minutes (daemon thread)
+4. **Automatic pagination** - No 10k limit, unlimited services
 
 ### Component Layers
 
-1. **Data Layer** (`data/`)
-   - `data_loader.py`: Parses OpenSearch JSON responses into pandas DataFrames
-   - `opensearch_client.py`: Queries OpenSearch (limited to 4-hour windows, max 10k results)
-   - `duckdb_manager.py`: OLAP database for fast analytical queries
+**Data:** `data/ingestion/` + `data/database/`
+- `keycloak_auth.py` - OAuth2 with auto-refresh (4 min)
+- `platform_api_client.py` - Pagination (unlimited services)
+- `data_loader.py` - Parse Platform API → DataFrames (90+ fields)
+- `duckdb_manager.py` - OLAP DB (90+ columns, indexed)
 
-2. **Analytics Layer** (`analytics/`)
-   - `slo_calculator.py`: SLI/SLO metrics, error budgets, burn rates
-   - `degradation_detector.py`: Detects services with declining performance over time windows
-   - `trend_analyzer.py`: Predictive analysis using linear regression
-   - `metrics.py`: Aggregated metrics (top services, slowest services, etc.)
+**Analytics:** `analytics/`
+- `slo_calculator.py` - SLI/SLO metrics, error budgets, burn rates
+- `degradation_detector.py` - Week-over-week comparison
+- `trend_analyzer.py` - Predictions (linear regression, 2+ weeks data)
+- `metrics.py` - 20 functions (8 new Platform API functions)
 
-3. **Agent Layer** (`agent/`)
-   - `claude_client.py`: AWS Bedrock integration with conversation history and tool use handling
-   - `function_tools.py`: 15 analytics functions exposed to Claude via tool calling. The `FunctionExecutor` class dispatches tool calls to appropriate analytics modules.
+**Agent:** `agent/`
+- `claude_client.py` - AWS Bedrock + conversation history
+- `function_tools.py` - FunctionExecutor dispatches 20 tool calls
 
-4. **UI Layer**
-   - `app.py`: Streamlit web interface with dashboard and chat tabs. Uses `@st.cache_resource` to initialize system components once.
+**UI:** `app.py` - Streamlit with `@st.cache_resource` for component initialization
 
 ## Critical Code Patterns
 
@@ -71,29 +88,74 @@ total_requests = int(total_req) if pd.notna(total_req) else 0
 ```
 
 This pattern appears in:
-- `analytics/degradation_detector.py` (lines 108-119, 194-204, 262-271)
-- `analytics/trend_analyzer.py` (lines 138-148, 198-206, 246-259)
-- `analytics/slo_calculator.py` (lines 98-110, 158-168)
-- `analytics/metrics.py` (lines 48-54, 85-92, 194-204, 234-247)
-- `app.py` (lines 163-176)
+- `analytics/degradation_detector.py`
+- `analytics/trend_analyzer.py`
+- `analytics/slo_calculator.py`
+- `analytics/metrics.py`
+- `data/ingestion/data_loader.py`
 
-### OpenSearch Data Extraction Pattern
+### Platform API Response Parsing Pattern
 
-OpenSearch returns data in **two possible locations**. Always check both:
+**CRITICAL:** The Platform API returns services nested in a `summary` array. Always extract from this array:
 
 ```python
-# Extract from OpenSearch response
-source = hit.get('_source', {})
-fields = hit.get('fields', {})
-scripted_metric = source.get('scripted_metric', {})
+# ❌ WRONG - Treats entire response as 1 service
+if isinstance(data, dict):
+    return [data]
 
-# Try scripted_metric first (live OpenSearch), fallback to fields (for test JSON files)
-service_name = scripted_metric.get('service_name') or self._extract_first(fields.get('service_name'))
+# ✅ CORRECT - Extracts services from summary array
+if isinstance(data, dict):
+    if 'summary' in data and isinstance(data['summary'], list):
+        return data['summary']  # Returns 100+ services
+    return [data]  # Fallback for other formats
 ```
 
-This pattern is in `data/ingestion/data_loader.py` (lines 50-72 for service logs, 112-130 for error logs).
+**Platform API Response Structure:**
+```json
+{
+  "totalServiceCount": 122,
+  "totalSLO": 244,
+  "summary": [
+    { "transactionName": "service1", "errorRate": 0.5, ... },
+    { "transactionName": "service2", "errorRate": 1.2, ... },
+    // ... 100+ more services
+  ]
+}
+```
 
-**Important**: Production uses OpenSearch only, but the `fields` fallback is kept for test suite compatibility with local JSON files.
+**This bug caused only 1 service to load instead of 100+**. Fixed in `platform_api_client.py:186-190`.
+
+### Platform API Data Loading Pattern
+
+**Always use the complete 90+ field mapping** when loading Platform API data:
+
+```python
+# In data_loader.py - load_service_logs_from_platform_api()
+from data.ingestion.platform_api_client import PlatformAPIClient
+from data.ingestion.keycloak_auth import KeycloakAuthManager
+
+# Initialize clients
+auth_manager = KeycloakAuthManager()  # Auto-refreshing token
+api_client = PlatformAPIClient(auth_manager)
+
+# Fetch data (automatic pagination)
+end_time = int(datetime.now().timestamp() * 1000)
+start_time = int((datetime.now() - timedelta(days=7)).timestamp() * 1000)
+response = api_client.query_service_health(start_time, end_time)
+
+# Load into DataFrame with 90+ field mapping
+df = data_loader.load_service_logs_from_platform_api(response)
+
+# Insert into DuckDB
+db_manager.insert_service_logs(df)
+```
+
+**Key Platform API fields**:
+- Core: `service_name`, `total_count`, `error_rate`, `success_rate`
+- Percentiles: `response_time_p25/p50/p75/p80/p85/p90/p95/p99`
+- Error budgets: `eb_allocated_percent`, `eb_consumed_percent`, `eb_actual_consumed_percent`, `eb_left_percent`, `eb_health`
+- Aspirational SLO: `aspirational_slo`, `aspirational_eb_health`, `aspirational_response_health`
+- Advanced: `burn_rate`, `timeliness_health`, `eb_severity`, `response_severity`, `eb_slo_status`
 
 ### JSON Serialization Pattern for Claude Tool Results
 
@@ -170,329 +232,161 @@ self.conn.unregister('temp_service_df')
 
 **DO NOT** use `INSERT OR REPLACE` with multiple constraints. Use `DELETE + INSERT` instead.
 
-This pattern is in `data/database/duckdb_manager.py` (lines 123-132 for service logs, 168-177 for error logs).
+This pattern is in `data/database/duckdb_manager.py` (lines 228-234 for service logs).
 
 ## Configuration
 
-All configuration is centralized in `utils/config.py`:
+**File:** `utils/config.py` - Centralized configuration with Streamlit Cloud support (secrets → env vars fallback)
 
-```python
-# SLO Thresholds
-DEFAULT_ERROR_SLO_THRESHOLD = 1.0      # 1% error rate target
-DEFAULT_RESPONSE_TIME_SLO = 1.0        # 1 second target
-DEFAULT_SLO_TARGET_PERCENT = 98        # 98% of requests must meet SLO
-DEGRADATION_WINDOW_MINUTES = 30        # Time window for degradation detection
-DEGRADATION_THRESHOLD_PERCENT = 20     # 20% change = degradation
+**Key Thresholds:**
+- SLO: 98% standard, 99% aspirational | Error rate: 1% | Response time: 1s
+- Burn rate: >2.0 high risk, >5.0 critical
+- Time windows: 5 days default, 60 days max | Degradation: 7-day windows
 
-# Paths
-DUCKDB_PATH = DATABASE_DIR / "slo_analytics.duckdb"
-```
+**Credentials:** `.env` file (use `.env.example` as template):
+- AWS Bedrock: Access key, secret, region (`ap-south-1`), model ID (`global.anthropic.claude-sonnet-4-5-20250929-v1:0`)
+- Keycloak: URL, username, password, client_id (`web_app`)
+- Platform API: URL, application (`WMPlatform`), page size (200), verify_ssl (False for sandbox)
 
-All credentials are configured in `.env` (never commit this file):
-```
-# AWS Bedrock
-AWS_ACCESS_KEY_ID=...
-AWS_SECRET_ACCESS_KEY=...
-AWS_REGION=ap-south-1
-BEDROCK_MODEL_ID=global.anthropic.claude-sonnet-4-5-20250929-v1:0
-
-# OpenSearch
-OPENSEARCH_HOST=...
-OPENSEARCH_PORT=9200
-OPENSEARCH_USERNAME=admin
-OPENSEARCH_PASSWORD=...
-OPENSEARCH_USE_SSL=False
-OPENSEARCH_INDEX_SERVICE=hourly_wm_wmplatform_31854
-OPENSEARCH_INDEX_ERROR=hourly_wm_wmplatform_31854_error
-
-# Logging
-LOG_LEVEL=INFO
-```
-
-Use `.env.example` as a template for new setup.
-
-**Important**: The Bedrock model ID format is region-specific. The `global.` prefix enables cross-region inference.
+**Streamlit Cloud:** Use secrets instead of `.env` (Settings > Secrets). Config automatically checks secrets first.
 
 ## Tool Calling Flow
 
-Claude has access to 15 analytics functions via tool calling (`agent/function_tools.py`). The complete flow:
+**System Prompt:** `app.py` `display_chat()` function (lines ~135-329)
 
-1. **User sends message** via Streamlit chat → `app.py` receives input
-2. **Claude receives message** along with `TOOLS` list (tool definitions) in request body
-3. **Claude decides which tools to call** → returns `tool_use` content blocks in response
-4. **FunctionExecutor.execute()** dispatches each tool call:
-   ```python
-   function_map = {
-       "get_degrading_services": self._get_degrading_services,
-       "get_error_code_distribution": self._get_error_code_distribution,
-       # ... 13 more functions (15 total)
-   }
-   result = function_map[tool_name](**tool_input)
-   ```
-5. **Tool results serialized** using `DateTimeEncoder` → sent back to Claude as new user message
-6. **Claude synthesizes results** into natural language response → displayed to user
+**Flow:** User → Streamlit → Claude + TOOLS → tool_use blocks → FunctionExecutor → Analytics → DateTimeEncoder → Claude → User
 
-**Key architectural point**: The `FunctionExecutor` class acts as a dispatcher. Each `_get_*` wrapper method calls the corresponding analytics module method and ensures consistent return format.
+**FunctionExecutor** (`agent/function_tools.py`): Dispatcher with `function_map` routing 20 functions to analytics modules.
 
-Available functions:
+### Available Functions (20 usable)
 
-**Service Health:**
-- `get_degrading_services(time_window_minutes=30)` - Detects services with declining metrics
-- `get_slo_violations()` - Services currently violating SLO
-- `get_service_health_overview()` - System-wide health metrics
+**Standard (7):** health_overview, degrading_services, slo_violations, slowest_services, top_services_by_volume, service_summary, current_sli
 
-**Error Analysis:**
-- `get_error_code_distribution(service_name, time_window_minutes)` - HTTP error breakdown
-- `get_top_errors(limit=10)` - Most common errors
-- `get_error_prone_services(limit=10)` - Services with highest error rates
-- `get_error_details_by_code(error_code)` - Get detailed error logs for specific error code
+**Platform API Advanced (8):** services_by_burn_rate, aspirational_slo_gap, timeliness_issues, breach_vs_error_analysis, budget_exhausted_services, composite_health_score, severity_heatmap, slo_governance_status
 
-**Performance:**
-- `get_slowest_services(limit=10)` - Services by response time
-- `get_top_services_by_volume(limit=10)` - High-traffic services
-- `get_volume_trends(service_name, time_window_minutes)` - Request volume patterns
+**Performance (5):** calculate_error_budget, volume_trends, predict_issues_today, historical_patterns, error_prone_services
 
-**SLO Metrics:**
-- `get_current_sli(service_name)` - Current service level indicators
-- `calculate_error_budget(service_name, time_window_hours)` - Error budget tracking
-- `get_service_summary(service_name)` - Comprehensive service analysis
-
-**Predictions:**
-- `predict_issues_today()` - Services likely to have issues (using trend analysis)
-- `get_historical_patterns(service_name)` - Historical statistical analysis
+**Deprecated (3):** ❌ error_code_distribution, top_errors, error_details_by_code (no error_logs table)
 
 ## Time-Series Analysis
 
-The degradation detector compares two time windows:
+**Degradation Detection** (`analytics/degradation_detector.py`): Compare 7-day windows (baseline vs recent). Flag if >20% change in error_rate, burn_rate, or response_time.
 
-```
-Baseline Window          Recent Window
-[----------]             [----------]
-  30 mins                  30 mins
-                  ^
-                  |
-           comparison point
-```
+**Note:** Use day-based windows (7, 30 days), not minute-based.
 
-**How it works** (`analytics/degradation_detector.py`):
-1. Define recent window: last N minutes from max timestamp
-2. Define baseline window: N minutes before recent window
-3. Calculate metrics for both windows (AVG error_rate, response_time, etc.)
-4. Compare using percentage change: `((current - baseline) / baseline) * 100`
-5. Flag as degrading if change > threshold (default 20%)
+## Platform API Integration
 
-## OpenSearch Data Limits
+**KeycloakAuthManager** (`keycloak_auth.py`): Auto-refresh token every 4 min in daemon thread. No user intervention.
 
-The application is configured to query a **maximum 4-hour time window** from OpenSearch. This ensures:
-- Data stays well under the 10,000 result limit
-- Fast query performance
-- No need for Scroll API or pagination
+**PlatformAPIClient** (`platform_api_client.py`): Automatic pagination (no 10k limit). Loops through pages until empty.
 
-**Standard query pattern** (`data/ingestion/opensearch_client.py`):
-```python
-# Query with 4-hour window (use_scroll=False)
-response = client.query_service_logs(
-    start_time=start_time,
-    end_time=end_time,
-    size=1000,
-    use_scroll=False
-)
-```
+**Data Loading Workflow** (on "🔄 Refresh"):
+1. Calculate time window (5-60 days)
+2. Fetch: `api_client.query_service_health()` (auto-pagination)
+3. Parse: `data_loader.load_service_logs_from_platform_api()` (90+ fields → DataFrame)
+4. Reset index: `df.reset_index(drop=True)`
+5. Clear & insert: `DELETE + INSERT` (never `INSERT OR REPLACE`)
+6. Update state: `st.session_state.data_loaded = True`
 
-**Note**: The UI enforces the 4-hour maximum when users select custom time ranges.
+**Performance:** 5-15 sec for 100+ services, 7+ days.
 
 ## Testing
 
-Run all tests with:
-```bash
-python test_system.py
-```
+**Platform API Tests:** `python test_platform_api.py` (requires valid Keycloak creds in `.env`)
+- Tests: Auth, pagination, data loading, 20 functions, end-to-end
+- Expected: 5/5 passing
 
-This tests:
-1. Data loading from JSON files (for testing purposes only - production uses OpenSearch)
-2. SLO calculations
-3. Degradation detection
-4. Trend analysis
-5. Metrics aggregation
+**Legacy Tests:** `python test_system.py` (local JSON files, not Platform API)
 
-Expected output: 5/5 tests passing with ~60-70 services loaded.
-
-**Note**: The test suite uses local JSON files (`ServiceLogs7Amto11Am31Dec2025.json` and `ErrorLogs7Amto11Am31Dec2025.json`) for testing. In production, the application loads data exclusively from OpenSearch via the UI.
+**Auth Test:** `python test_keycloak_auth.py` (standalone OAuth2 test)
 
 ## Common Issues
 
-### Streamlit Not Picking Up Code Changes
-
-**Root cause:** Streamlit uses `@st.cache_resource` to cache initialized components (DuckDBManager, Claude client, etc.). Code changes to cached classes won't apply until restart.
-
-**Solution:**
-1. Stop Streamlit (Ctrl+C)
-2. Clear Python cache: `find . -type d -name "__pycache__" -exec rm -r {} + 2>/dev/null || true`
-3. Restart: `streamlit run app.py`
-
-Alternatively, use Streamlit's "Rerun" button in the UI, but this doesn't clear `@st.cache_resource` cached objects.
-
-### IndexError: index N is out of bounds for axis 0 with size N
-
-**Root cause:** DataFrame index is non-contiguous after `dropna()` operations. DuckDB expects continuous indices.
-
-**Solution:** Always call `df.reset_index(drop=True)` before inserting into DuckDB. See "DuckDB INSERT Pattern" above.
-
-### Only 1 service appearing despite 200+ in data
-
-**Root cause:** Data is in `_source.scripted_metric` not `fields`. This was fixed in `data/ingestion/data_loader.py` to check both locations.
-
-### NaN to integer conversion errors
-
-**Root cause:** Missing `pd.notna()` checks. See "NaN Handling Pattern" above.
-
-### DuckDB constraint errors with INSERT OR REPLACE
-
-**Root cause:** Multiple constraints on table. Use `DELETE + INSERT` instead.
-
-### IndexError during data parsing with large datasets
-
-**Root cause:** Missing error handling in data parsing loop. Wrap each record parse in try/except.
-
-### "Object of type Timestamp is not JSON serializable"
-
-**Root cause:** Analytics functions return pandas Timestamp or numpy types that can't be serialized to JSON for Claude.
-
-**Solution:** Use the custom `DateTimeEncoder` class when calling `json.dumps()`. See "JSON Serialization Pattern" above.
+| Issue | Cause | Solution |
+|-------|-------|----------|
+| **Streamlit not picking up changes** | `@st.cache_resource` caches components | Stop → clear `__pycache__` → restart |
+| **IndexError: index N out of bounds** | Non-contiguous DataFrame index after `dropna()` | `df.reset_index(drop=True)` before DuckDB insert |
+| **NaN to integer conversion** | Missing `pd.notna()` checks | Use pattern: `int(val) if pd.notna(val) else 0` |
+| **DuckDB constraint errors** | Multiple constraints with `INSERT OR REPLACE` | Use `DELETE + INSERT` pattern |
+| **Timestamp not JSON serializable** | pandas/numpy types in tool results | Use `json.dumps(result, cls=DateTimeEncoder)` |
+| **Invalid user credentials** | Wrong Keycloak creds | Update `.env` KEYCLOAK_USERNAME/PASSWORD |
+| **401 Unauthorized** | Auth failed | Run `python test_keycloak_auth.py` |
+| **No data loaded** | Wrong Platform API URL | Verify PLATFORM_API_URL/APPLICATION in `.env` |
+| **SSL verification errors** | Sandbox cert issues | Set `PLATFORM_API_VERIFY_SSL=False` (sandbox only) |
+| **Missing columns** | Old DB schema | Delete `slo_analytics.duckdb`, restart |
+| **Only 1 service loads** | Wrong parsing (not extracting `summary[]` array) | Check `platform_api_client.py:186-190` |
+| **Only 1 day of data** | Daily index may not retain history | Check with Platform API team on retention policy |
 
 ## Database Schema
 
-DuckDB stores two main tables (`data/database/duckdb_manager.py`):
+**service_logs** (90+ columns, `duckdb_manager.py`):
+- PK: `id` | Identifiers: `app_id`, `sid`, `service_name` | Time: `record_time`
+- Core: `total_count`, `error_count/rate`, `success_count/rate`, `response_time_*` (p25-p99)
+- Error budgets: `eb_*` (allocated, consumed, left, health, breached)
+- Aspirational: `aspirational_*` (slo, eb_health, response_health)
+- Advanced: `burn_rate`, `timeliness_health`, `eb_severity`, `response_severity`, `eb_slo_status`
 
-**service_logs table**:
-- Primary key: `id` (VARCHAR)
-- Core metrics: `total_count`, `success_count`, `error_count`, `error_rate`, `response_time_avg`
-- SLO targets: `target_error_slo_perc`, `target_response_slo_sec`, `response_target_percent`
-- Time dimension: `record_time` (TIMESTAMP)
-- Identifiers: `app_id`, `sid`, `service_name`
+**Indexes:** service_time, service_name, burn_rate, eb_health, response_health, eb_breached
 
-**error_logs table**:
-- Primary key: `id` (VARCHAR)
-- Error breakdown: `error_codes` (VARCHAR), `technical_error_count`, `business_error_count`
-- Metrics: `error_count`, `total_count`, `response_time_avg`
-- Time dimension: `record_time` (TIMESTAMP)
-- Identifiers: `wm_application_id`, `wm_application_name`, `wm_transaction_id`
-
-**Critical constraint**: Both tables use single-column PRIMARY KEY. Never use `INSERT OR REPLACE` with these schemas - use `DELETE + INSERT` pattern instead.
+**error_logs:** ⚠️ DEPRECATED (backward compat only)
 
 ## File Organization
 
 ```
-analytics/
-  ├── slo_calculator.py        - SLI/SLO metrics, error budgets, burn rates
-  ├── degradation_detector.py  - Time-window comparison for degradation detection
-  ├── trend_analyzer.py        - Linear regression predictions
-  └── metrics.py               - Aggregated metrics (top services, slowest, etc.)
-
-agent/
-  ├── claude_client.py         - AWS Bedrock integration with conversation history
-  └── function_tools.py        - 15 tool definitions + FunctionExecutor dispatcher
-
-data/
-  ├── ingestion/
-  │   ├── data_loader.py       - Parses OpenSearch JSON to pandas DataFrames
-  │   └── opensearch_client.py - Queries OpenSearch (4-hour max window, no Scroll API)
-  └── database/
-      └── duckdb_manager.py    - OLAP database with INSERT/query methods
-
-utils/
-  ├── config.py                - All configuration (AWS, OpenSearch, SLO thresholds)
-  └── logger.py                - Logging setup
-
-app.py                         - Streamlit UI (dashboard + chat tabs)
-test_system.py                 - Complete test suite
+analytics/          slo_calculator, degradation_detector, trend_analyzer, metrics
+agent/              claude_client (Bedrock), function_tools (dispatcher)
+data/ingestion/     keycloak_auth, platform_api_client, data_loader
+data/database/      duckdb_manager
+utils/              config, logger
+app.py              Streamlit UI
+test_*.py           Test suites
 ```
 
-## Streamlit App Structure
+## Streamlit App
 
-The app has two tabs:
-1. **Dashboard Tab** - Displays metrics, charts, SLO violations
-2. **Chat Tab** - Conversational interface with Claude
+**Tabs:** Dashboard (metrics/charts) | Chat (Claude interface)
 
-**State management** (`app.py`):
-- `st.session_state.messages` - Chat history (list of dicts with `role` and `content`)
-- `@st.cache_resource` - Caches initialized components:
-  - `init_system()` returns (db_manager, analytics_modules, claude_client, function_executor)
-  - **CRITICAL**: Code changes to cached classes won't apply until Streamlit restart + cache clear
+**Initialization** (`@st.cache_resource`): Components init once per session. Code changes require restart + cache clear.
 
-**Conversation history pattern** (`agent/claude_client.py`):
-```python
-# ClaudeClient maintains conversation_history as instance variable
-self.conversation_history = []
+**State:**
+- `st.session_state.messages` - Chat history
+- `st.session_state.data_loaded` - Data fetch status
 
-# Each user message appends to history
-self.conversation_history.append({"role": "user", "content": user_message})
-
-# Each assistant response appends to history
-self.conversation_history.append({"role": "assistant", "content": response_content})
-
-# Tool results are sent as new user messages
-self.conversation_history.append({"role": "user", "content": tool_results})
-```
-
-This maintains multi-turn context for Claude across the entire session.
+**Conversation History** (`claude_client.py`):
+- Maintained as instance variable
+- Tool results sent as `{"role": "user", "content": [tool_result_blocks]}`
+- Each `tool_result` must include `tool_use_id` from Claude's `tool_use`
+- History passed to Bedrock on every request
 
 ## Development Workflows
 
-### When modifying analytics functions:
-1. **Always add NaN checks** for integer conversions (see "NaN Handling Pattern")
-2. **Test with** `python test_system.py` (uses local JSON files)
-3. **Test with OpenSearch** in the UI to verify production behavior
-4. **Use `pd.notna()`** before any `int()` conversion
-5. **Return consistent structures** (dict/list) for Claude to parse
-6. **Use DateTimeEncoder** when serializing results
+### Modifying Analytics Functions
+1. Add NaN checks: `int(val) if pd.notna(val) else 0`
+2. Test: `python test_platform_api.py`
+3. Return consistent structures (dict/list)
+4. Use `DateTimeEncoder` for serialization
 
-### When adding new analytics functions:
-1. **Add method** to appropriate analytics module (e.g., `analytics/metrics.py`)
-   ```python
-   def get_my_metric(self, param: str) -> Dict[str, Any]:
-       """Calculate my metric."""
-       # Query DuckDB, aggregate data
-       return {"metric_name": value, "timestamp": pd.Timestamp.now()}
-   ```
+### Adding New Analytics Functions
+1. Add method to analytics module (e.g., `metrics.py`)
+2. Add wrapper in `FunctionExecutor` (`function_tools.py`)
+3. Register in `function_map` in `execute()`
+4. Add tool definition to `TOOLS` list
+5. Update system prompt (`app.py` display_chat)
+6. Test via Streamlit
 
-2. **Add wrapper** in `FunctionExecutor` (`agent/function_tools.py`)
-   ```python
-   def _get_my_metric(self, param: str) -> Dict[str, Any]:
-       return self.metrics.get_my_metric(param)
-   ```
-
-3. **Register in function_map** in `FunctionExecutor.execute()`
-   ```python
-   function_map = {
-       # ... existing functions
-       "get_my_metric": self._get_my_metric,
-   }
-   ```
-
-4. **Add tool definition** to `TOOLS` list in `agent/function_tools.py`
-   ```python
-   {
-       "name": "get_my_metric",
-       "description": "Calculate my metric for a given parameter",
-       "input_schema": {
-           "type": "object",
-           "properties": {
-               "param": {
-                   "type": "string",
-                   "description": "Parameter description"
-               }
-           },
-           "required": ["param"]
-       }
-   }
-   ```
-
-5. **Test** via Streamlit chat interface with sample queries
-
-### When debugging Streamlit cache issues:
+### Debugging Streamlit Cache
 ```bash
-# Stop Streamlit (Ctrl+C)
-find . -type d -name "__pycache__" -exec rm -r {} + 2>/dev/null || true
+# Stop → clear cache → restart
+find . -type d -name "__pycache__" -exec rm -r {} +
 streamlit run app.py
 ```
+
+## Platform API Migration (Jan 2026)
+
+**Status:** ✅ Complete | **Breaking:** None (backward compatible)
+
+**Changes:** OpenSearch→Platform API | Basic Auth→Keycloak OAuth2 | 10k→Unlimited | 4hrs→5-60 days | Hourly→Daily | 26→90+ cols | 15→20 functions
+
+**New:** Burn rate monitoring, multi-tier SLO (98%/99%), aspirational gap detection, timeliness tracking, composite health (0-100), breach vs error analysis, severity heatmap
+
+**See:** PLATFORM_API_MIGRATION.md | DEPRECATED.md

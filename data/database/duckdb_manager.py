@@ -35,21 +35,31 @@ class DuckDBManager:
             raise
 
     def _create_tables(self):
-        """Create tables for service and error logs."""
-        # Service logs table
+        """Create tables for service and error logs.
+
+        The service_logs table schema now includes 90+ columns to support
+        Platform API data including burn rate, health indicators, aspirational SLO
+        metrics, timeliness tracking, and severity indicators.
+        """
+        # Service logs table - Extended schema for Platform API
         self.conn.execute("""
             CREATE TABLE IF NOT EXISTS service_logs (
+                -- Core identifiers (5 columns)
                 id VARCHAR PRIMARY KEY,
                 app_id INTEGER,
                 sid INTEGER,
                 service_name VARCHAR,
                 record_time TIMESTAMP,
+
+                -- Request volume & success metrics (6 columns)
                 total_count INTEGER,
                 success_count INTEGER,
                 error_count INTEGER,
-                na_error_count INTEGER,
                 success_rate DOUBLE,
                 error_rate DOUBLE,
+                total_data_points DOUBLE,
+
+                -- Response time metrics (11 columns)
                 response_time_avg DOUBLE,
                 response_time_min DOUBLE,
                 response_time_max DOUBLE,
@@ -61,9 +71,82 @@ class DuckDBManager:
                 response_time_p90 DOUBLE,
                 response_time_p95 DOUBLE,
                 response_time_p99 DOUBLE,
+
+                -- Standard SLO targets (3 columns)
                 target_error_slo_perc DOUBLE,
                 target_response_slo_sec DOUBLE,
-                response_target_percent DOUBLE
+                response_target_percent DOUBLE,
+
+                -- Standard error budget metrics (7 columns)
+                eb_allocated_percent DOUBLE,
+                eb_allocated_count INTEGER,
+                eb_consumed_percent DOUBLE,
+                eb_consumed_count INTEGER,
+                eb_actual_consumed_percent DOUBLE,
+                eb_left_percent DOUBLE,
+                eb_left_count INTEGER,
+
+                -- Standard response budget metrics (7 columns)
+                response_allocated_percent DOUBLE,
+                response_allocated_count INTEGER,
+                response_consumed_percent DOUBLE,
+                response_consumed_count INTEGER,
+                response_actual_consumed_percent DOUBLE,
+                response_left_percent DOUBLE,
+                response_left_count INTEGER,
+
+                -- Response breach tracking (4 columns)
+                response_breached BOOLEAN,
+                response_breach_count INTEGER,
+                response_error_rate DOUBLE,
+                response_success_rate DOUBLE,
+
+                -- Aspirational SLO metrics (15 columns)
+                aspirational_slo DOUBLE,
+                aspirational_eb_allocated_percent DOUBLE,
+                aspirational_eb_allocated_count INTEGER,
+                aspirational_eb_consumed_percent DOUBLE,
+                aspirational_eb_consumed_count INTEGER,
+                aspirational_eb_actual_consumed_percent DOUBLE,
+                aspirational_eb_left_percent DOUBLE,
+                aspirational_eb_left_count INTEGER,
+                aspirational_response_target_percent DOUBLE,
+                aspirational_response_allocated_percent DOUBLE,
+                aspirational_response_allocated_count INTEGER,
+                aspirational_response_consumed_percent DOUBLE,
+                aspirational_response_actual_consumed_percent DOUBLE,
+                aspirational_response_left_percent DOUBLE,
+                aspirational_response_left_count INTEGER,
+
+                -- Timeliness tracking (3 columns)
+                timeliness_consumed_percent DOUBLE,
+                aspirational_timeliness_consumed_percent DOUBLE,
+                timeliness_health VARCHAR,
+
+                -- Health indicators (6 columns)
+                eb_health VARCHAR,
+                response_health VARCHAR,
+                aspirational_eb_health VARCHAR,
+                aspirational_response_health VARCHAR,
+                timeliness_severity VARCHAR,
+                eb_or_response_breached BOOLEAN,
+
+                -- Severity color codes (4 columns)
+                response_severity VARCHAR,
+                eb_severity VARCHAR,
+                aspirational_response_severity VARCHAR,
+                aspirational_eb_severity VARCHAR,
+
+                -- Advanced metrics (3 columns)
+                burn_rate DOUBLE,
+                eb_breached BOOLEAN,
+                eb_slo_status VARCHAR,
+
+                -- Metadata (4 columns)
+                sort_data DOUBLE,
+                data_for VARCHAR,
+                timezone VARCHAR,
+                sre_product VARCHAR
             )
         """)
 
@@ -89,12 +172,21 @@ class DuckDBManager:
         """)
 
         # Create indexes for faster queries
+        # Core indexes
         self.conn.execute("CREATE INDEX IF NOT EXISTS idx_service_time ON service_logs(record_time)")
         self.conn.execute("CREATE INDEX IF NOT EXISTS idx_service_name ON service_logs(service_name)")
+
+        # Health and performance indexes (NEW for Platform API)
+        self.conn.execute("CREATE INDEX IF NOT EXISTS idx_burn_rate ON service_logs(burn_rate)")
+        self.conn.execute("CREATE INDEX IF NOT EXISTS idx_eb_health ON service_logs(eb_health)")
+        self.conn.execute("CREATE INDEX IF NOT EXISTS idx_response_health ON service_logs(response_health)")
+        self.conn.execute("CREATE INDEX IF NOT EXISTS idx_eb_breached ON service_logs(eb_breached)")
+
+        # Error logs indexes (kept for backwards compatibility with OpenSearch)
         self.conn.execute("CREATE INDEX IF NOT EXISTS idx_error_time ON error_logs(record_time)")
         self.conn.execute("CREATE INDEX IF NOT EXISTS idx_error_codes ON error_logs(error_codes)")
 
-        logger.info("Database tables created/verified")
+        logger.info("Database tables created/verified with extended Platform API schema (90+ columns)")
 
     def insert_service_logs(self, df: pd.DataFrame):
         """Insert service logs into the database.

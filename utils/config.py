@@ -15,7 +15,8 @@ def get_config(key: str, default: str = "") -> str:
         # Try Streamlit secrets first (for cloud deployment)
         if hasattr(st, 'secrets') and key in st.secrets:
             return st.secrets[key]
-    except (ImportError, FileNotFoundError):
+    except (ImportError, FileNotFoundError, Exception):
+        # Catch any Streamlit errors (including when secrets aren't configured)
         pass
     # Fall back to environment variables (for local development)
     return os.getenv(key, default)
@@ -35,7 +36,7 @@ AWS_SECRET_ACCESS_KEY = get_config("AWS_SECRET_ACCESS_KEY")
 AWS_REGION = get_config("AWS_REGION", "ap-south-1")
 BEDROCK_MODEL_ID = get_config("BEDROCK_MODEL_ID", "global.anthropic.claude-sonnet-4-5-20250929-v1:0")
 
-# OpenSearch configuration
+# OpenSearch configuration (DEPRECATED - kept for backwards compatibility)
 OPENSEARCH_HOST = get_config("OPENSEARCH_HOST", "localhost")
 OPENSEARCH_PORT = int(get_config("OPENSEARCH_PORT", "9200"))
 OPENSEARCH_USERNAME = get_config("OPENSEARCH_USERNAME", "admin")
@@ -44,14 +45,40 @@ OPENSEARCH_USE_SSL = get_config("OPENSEARCH_USE_SSL", "False").lower() == "true"
 OPENSEARCH_INDEX_SERVICE = get_config("OPENSEARCH_INDEX_SERVICE", "hourly_wm_wmplatform_31854")
 OPENSEARCH_INDEX_ERROR = get_config("OPENSEARCH_INDEX_ERROR", "hourly_wm_wmplatform_31854_error")
 
+# Keycloak Authentication (for Platform API)
+KEYCLOAK_URL = get_config(
+    "KEYCLOAK_URL",
+    "https://wm-sandbox-auth-1.watermelon.us/realms/watermelon/protocol/openid-connect/token"
+)
+KEYCLOAK_USERNAME = get_config("KEYCLOAK_USERNAME", "wmadmin")
+KEYCLOAK_PASSWORD = get_config("KEYCLOAK_PASSWORD", "")
+KEYCLOAK_CLIENT_ID = get_config("KEYCLOAK_CLIENT_ID", "web_app")
+KEYCLOAK_TOKEN_REFRESH_INTERVAL = 240  # 4 minutes in seconds
+
+# Platform API configuration
+PLATFORM_API_URL = get_config(
+    "PLATFORM_API_URL",
+    "https://wm-sandbox-1.watermelon.us/services/wmerrorbudgetstatisticsservice/api/v1/services/health"
+)
+PLATFORM_API_APPLICATION = get_config("PLATFORM_API_APPLICATION", "WMPlatform")
+PLATFORM_API_PAGE_SIZE = int(get_config("PLATFORM_API_PAGE_SIZE", "200"))
+PLATFORM_API_VERIFY_SSL = get_config("PLATFORM_API_VERIFY_SSL", "False").lower() == "true"
+
 # SLO Thresholds (configurable)
 DEFAULT_ERROR_SLO_THRESHOLD = 1.0  # 1% error rate
 DEFAULT_RESPONSE_TIME_SLO = 1.0    # 1 second
 DEFAULT_SLO_TARGET_PERCENT = 98    # 98% of requests must meet SLO
+ASPIRATIONAL_SLO_TARGET_PERCENT = 99  # 99% aspirational target
 
 # Analytics configuration
-DEGRADATION_WINDOW_MINUTES = 30
+# Updated for daily data granularity (Platform API provides daily aggregations)
+DEGRADATION_WINDOW_DAYS = 7  # Compare last 7 days vs previous 7 days (was 30 minutes for OpenSearch)
+DEGRADATION_WINDOW_MINUTES = 30  # Kept for backwards compatibility with OpenSearch
 DEGRADATION_THRESHOLD_PERCENT = 20  # 20% increase is considered degradation
+
+# Time window configuration for Platform API
+DEFAULT_TIME_WINDOW_DAYS = 5  # Default to 5 days
+MAX_TIME_WINDOW_DAYS = 60  # Support up to 2 months of historical data
 
 # Logging
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
