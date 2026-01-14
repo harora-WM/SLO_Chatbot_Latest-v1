@@ -378,10 +378,18 @@ class ClaudeClient:
                     content.append({'type': 'text', 'text': full_response_text})
                 content.extend(tool_uses)
 
+                # ✅ FIX: Always add content, even if empty (to maintain history integrity)
                 if content:
                     self.conversation_history.append({
                         "role": "assistant",
                         "content": content
+                    })
+                elif not tool_uses:
+                    # Empty response - add placeholder to maintain history
+                    logger.warning("Empty response from Claude in streaming, adding placeholder")
+                    self.conversation_history.append({
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": ""}]
                     })
 
                 # Handle tool use if needed
@@ -402,26 +410,42 @@ class ClaudeClient:
                         try:
                             result = tool_executor.execute(tool_name, tool_input)
                             result_json = json.dumps(result, cls=DateTimeEncoder)
-                            if not result_json or result_json == "null":
+                            if not result_json or result_json == "null" or result_json == "{}":
                                 result_json = json.dumps({"message": "No data found"})
                             tool_results.append({
                                 "type": "tool_result",
                                 "tool_use_id": tool_use_id,
                                 "content": result_json
                             })
+                            logger.info(f"✓ Tool {tool_name} result added to history (use_id: {tool_use_id})")
                         except Exception as e:
-                            logger.error(f"Tool execution failed: {e}")
+                            logger.error(f"Tool execution failed: {e}", exc_info=True)
                             tool_results.append({
                                 "type": "tool_result",
                                 "tool_use_id": tool_use_id,
                                 "content": json.dumps({"error": str(e)})
                             })
+                            logger.info(f"✓ Tool {tool_name} error added to history (use_id: {tool_use_id})")
+
+                    # ✅ FIX: Validate all tool results are present before adding to history
+                    if len(tool_results) != len(tool_uses):
+                        logger.error(f"Tool result count mismatch! Expected {len(tool_uses)}, got {len(tool_results)}")
+                        # Add missing tool results as errors
+                        for tool_use in tool_uses:
+                            if not any(r["tool_use_id"] == tool_use.get("id") for r in tool_results):
+                                logger.error(f"Missing result for tool_use_id: {tool_use.get('id')}")
+                                tool_results.append({
+                                    "type": "tool_result",
+                                    "tool_use_id": tool_use.get("id"),
+                                    "content": json.dumps({"error": "Tool result missing"})
+                                })
 
                     # Add tool results to history
                     self.conversation_history.append({
                         "role": "user",
                         "content": tool_results
                     })
+                    logger.info(f"✓ Added {len(tool_results)} tool results to conversation history")
 
                     # Prepare next request
                     request_body["messages"] = self.conversation_history
