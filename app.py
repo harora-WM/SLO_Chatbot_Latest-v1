@@ -1,6 +1,15 @@
 """Streamlit web UI for SLO chatbot."""
 
 import streamlit as st
+
+# Page configuration
+st.set_page_config(
+    page_title="SLO Chatbot",
+    page_icon="📊",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
 from datetime import datetime
 
 # Import our modules
