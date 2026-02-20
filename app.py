@@ -26,7 +26,7 @@ from agent.function_tools import FunctionExecutor, TOOLS
 from utils.logger import setup_logger
 from utils.config import DEFAULT_TIME_WINDOW_DAYS, MAX_TIME_WINDOW_DAYS
 
-logger = setup_logger(__name__)
+# logger = setup_logger(__name__)
 
 # Page configuration
 st.set_page_config(
