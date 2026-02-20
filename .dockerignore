@@ -1,0 +1,25 @@
+# Python
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Environment (pass secrets at runtime via --env-file or -e flags)
+.env
+
+# DuckDB runtime files (DB is created fresh on startup)
+data/database/*.duckdb
+data/database/*.duckdb.wal
+
+# Large JSON log files (not needed in container)
+*.json
+
+# Git
+.git/
+.gitignore
+
+# Docs (not needed in container)
+*.md
+ARCHITECTURE.md
+QUICK_REFERENCE.md
