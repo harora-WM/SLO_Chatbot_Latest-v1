@@ -57,7 +57,7 @@ class DegradationDetector:
                 AVG(response_time_p99) as avg_response_time_p99,
                 SUM(total_count) as total_requests,
                 SUM(error_count) as total_errors
-            FROM service_logs
+            FROM service_logs_eb
             WHERE record_time >= '{window_start}' AND record_time <= '{current_time}'
             GROUP BY service_name
         """
@@ -73,7 +73,7 @@ class DegradationDetector:
                 AVG(response_time_p99) as avg_response_time_p99,
                 SUM(total_count) as total_requests,
                 SUM(error_count) as total_errors
-            FROM service_logs
+            FROM service_logs_eb
             WHERE record_time >= '{baseline_start}' AND record_time < '{baseline_end}'
             GROUP BY service_name
         """
@@ -157,87 +157,6 @@ class DegradationDetector:
         logger.info(f"Found {len(degrading_services)} degrading services")
         return degrading_services
 
-    def get_error_code_distribution(self,
-                                   service_name: Optional[str] = None,
-                                   time_window_minutes: int = 30) -> Dict[str, Any]:
-        """Get error code distribution for degrading services.
-
-        Args:
-            service_name: Optional service name filter
-            time_window_minutes: Time window for analysis
-
-        Returns:
-            Dictionary with error code distribution
-        """
-        # Get time range
-        time_range = self.db_manager.get_time_range()
-        if not time_range['max_time']:
-            return {'error': 'No data available'}
-
-        current_time = time_range['max_time']
-        window_start = current_time - timedelta(minutes=time_window_minutes)
-
-        # Build query
-        where_clauses = [
-            f"record_time >= '{window_start}'",
-            f"record_time <= '{current_time}'"
-        ]
-
-        if service_name:
-            # Get transaction IDs for this service from service_logs
-            service_query = f"""
-                SELECT DISTINCT sid as transaction_id
-                FROM service_logs
-                WHERE service_name = '{service_name}'
-            """
-            service_df = self.db_manager.query(service_query)
-            if not service_df.empty:
-                transaction_ids = service_df['transaction_id'].tolist()
-                where_clauses.append(
-                    f"wm_transaction_id IN ({','.join(map(str, transaction_ids))})"
-                )
-
-        where_sql = " AND ".join(where_clauses)
-
-        sql = f"""
-            SELECT
-                error_codes,
-                COUNT(*) as occurrence_count,
-                SUM(error_count) as total_errors,
-                SUM(total_count) as total_requests,
-                AVG(response_time_avg) as avg_response_time
-            FROM error_logs
-            WHERE {where_sql}
-            GROUP BY error_codes
-            ORDER BY total_errors DESC
-        """
-
-        df = self.db_manager.query(sql)
-
-        # Convert to distribution
-        distribution = []
-        total_errors_all = df['total_errors'].sum()
-
-        for _, row in df.iterrows():
-            # Handle NaN values safely
-            total_err = row['total_errors']
-            occ_count = row['occurrence_count']
-            percentage = (total_err / total_errors_all * 100) if (total_errors_all > 0 and pd.notna(total_err)) else 0
-            distribution.append({
-                'error_code': row['error_codes'],
-                'count': int(total_err) if pd.notna(total_err) else 0,
-                'percentage': percentage,
-                'occurrences': int(occ_count) if pd.notna(occ_count) else 0,
-                'avg_response_time': row['avg_response_time'] if pd.notna(row['avg_response_time']) else 0.0
-            })
-
-        return {
-            'service_name': service_name or 'all_services',
-            'time_window_minutes': time_window_minutes,
-            'total_errors': int(total_errors_all) if (not df.empty and pd.notna(total_errors_all)) else 0,
-            'distribution': distribution
-        }
-
     def get_volume_trends(self,
                          service_name: str,
                          time_window_minutes: int = 30) -> Dict[str, Any]:
@@ -266,7 +185,7 @@ class DegradationDetector:
                 success_count,
                 error_rate,
                 response_time_avg
-            FROM service_logs
+            FROM service_logs_eb
             WHERE service_name = '{service_name}'
                 AND record_time >= '{window_start}'
                 AND record_time <= '{current_time}'

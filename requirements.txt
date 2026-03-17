@@ -4,6 +4,7 @@ python-dotenv==1.0.0
 
 # Data processing
 pandas==2.2.0
+numpy==1.26.4
 duckdb==0.10.0
 
 # AWS Bedrock
@@ -21,9 +22,6 @@ pytz==2024.1
 # Visualization
 plotly==5.18.0
 altair==5.2.0
-
-# OpenSearch (for future real-time integration)
-opensearch-py==2.4.2
 
 # Type hints
 typing-extensions==4.9.0

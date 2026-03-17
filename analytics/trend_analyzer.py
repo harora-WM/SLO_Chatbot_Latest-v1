@@ -226,43 +226,6 @@ class TrendAnalyzer:
             'hourly_patterns': hourly_patterns
         }
 
-    def compare_services(self, service_names: List[str]) -> Dict[str, Any]:
-        """Compare multiple services.
-
-        Args:
-            service_names: List of service names to compare
-
-        Returns:
-            Dictionary with comparison data
-        """
-        comparisons = []
-
-        for service in service_names:
-            df = self.db_manager.get_service_logs(service_name=service)
-
-            if df.empty:
-                continue
-
-            # Handle NaN values safely
-            total_req = df['total_count'].sum()
-            total_err = df['error_count'].sum()
-            comparisons.append({
-                'service_name': service,
-                'avg_error_rate': df['error_rate'].mean(),
-                'avg_response_time': df['response_time_avg'].mean(),
-                'total_requests': int(total_req) if pd.notna(total_req) else 0,
-                'total_errors': int(total_err) if pd.notna(total_err) else 0,
-                'slo_compliance': {
-                    'error_rate_target': df['target_error_slo_perc'].iloc[0],
-                    'response_time_target': df['target_response_slo_sec'].iloc[0]
-                }
-            })
-
-        return {
-            'services': comparisons,
-            'comparison_count': len(comparisons)
-        }
-
     @staticmethod
     def _calculate_linear_trend(values: np.ndarray) -> float:
         """Calculate linear trend (slope) for a series of values.
@@ -281,50 +244,3 @@ class TrendAnalyzer:
         slope = np.polyfit(x, values, 1)[0]
         return float(slope)
 
-    def get_anomalies(self, service_name: str, threshold_std: float = 2.0) -> List[Dict[str, Any]]:
-        """Detect anomalies in service metrics.
-
-        Args:
-            service_name: Service name
-            threshold_std: Standard deviation threshold for anomaly detection
-
-        Returns:
-            List of detected anomalies
-        """
-        df = self.db_manager.get_service_logs(service_name=service_name)
-
-        if df.empty:
-            return []
-
-        df = df.sort_values('record_time')
-
-        # Calculate statistics
-        error_rate_mean = df['error_rate'].mean()
-        error_rate_std = df['error_rate'].std()
-        response_time_mean = df['response_time_avg'].mean()
-        response_time_std = df['response_time_avg'].std()
-
-        anomalies = []
-
-        for _, row in df.iterrows():
-            # Check for error rate anomalies
-            error_rate_zscore = abs(row['error_rate'] - error_rate_mean) / error_rate_std if error_rate_std > 0 else 0
-            response_time_zscore = abs(row['response_time_avg'] - response_time_mean) / response_time_std if response_time_std > 0 else 0
-
-            if error_rate_zscore > threshold_std or response_time_zscore > threshold_std:
-                anomaly_type = []
-                if error_rate_zscore > threshold_std:
-                    anomaly_type.append('error_rate')
-                if response_time_zscore > threshold_std:
-                    anomaly_type.append('response_time')
-
-                anomalies.append({
-                    'timestamp': str(row['record_time']),
-                    'anomaly_type': anomaly_type,
-                    'error_rate': row['error_rate'],
-                    'error_rate_zscore': error_rate_zscore,
-                    'response_time': row['response_time_avg'],
-                    'response_time_zscore': response_time_zscore
-                })
-
-        return anomalies

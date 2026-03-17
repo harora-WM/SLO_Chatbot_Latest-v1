@@ -7,19 +7,22 @@ __pycache__/
 
 # Environment (pass secrets at runtime via --env-file or -e flags)
 .env
+.streamlit/secrets.toml
 
 # DuckDB runtime files (DB is created fresh on startup)
 data/database/*.duckdb
 data/database/*.duckdb.wal
 
-# Large JSON log files (not needed in container)
-*.json
-
 # Git
 .git/
 .gitignore
 
-# Docs (not needed in container)
+# Docs
 *.md
-ARCHITECTURE.md
-QUICK_REFERENCE.md
+
+# IDE
+.vscode/
+.idea/
+
+# Claude Code
+.claude/

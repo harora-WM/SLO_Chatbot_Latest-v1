@@ -12,8 +12,10 @@ from utils.logger import setup_logger
 from utils.config import (
     PLATFORM_API_URL,
     PLATFORM_API_APPLICATION,
+    PLATFORM_API_APPLICATION_ID,
     PLATFORM_API_PAGE_SIZE,
-    PLATFORM_API_VERIFY_SSL
+    PLATFORM_API_VERIFY_SSL,
+    PLATFORM_API_PROJECT_ID
 )
 
 # Disable SSL warnings since we use verify=False
@@ -40,8 +42,10 @@ class PlatformAPIClient:
         self.auth_manager = auth_manager
         self.base_url = PLATFORM_API_URL
         self.application = PLATFORM_API_APPLICATION
+        self.application_id = PLATFORM_API_APPLICATION_ID
         self.page_size = PLATFORM_API_PAGE_SIZE
         self.verify_ssl = PLATFORM_API_VERIFY_SSL
+        self.project_id = PLATFORM_API_PROJECT_ID
 
         logger.info(f"PlatformAPIClient initialized | URL: {self.base_url}")
 
@@ -153,9 +157,12 @@ class PlatformAPIClient:
 
         # Prepare request
         params = {
+            'application_id': self.application_id,
+            'project_id': self.project_id,
             'start_time': start_time,
             'end_time': end_time,
-            'application': application,
+            'range': 'CUSTOM',
+            'index': 'DAILY',
             'page_id': page_id,
             'page_size': page_size
         }

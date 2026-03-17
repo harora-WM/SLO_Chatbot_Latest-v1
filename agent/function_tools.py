@@ -43,7 +43,7 @@ class FunctionExecutor:
             Function result
         """
         function_map = {
-            # Standard Performance & Health (6 functions)
+            # Standard Performance & Health (7 functions)
             "get_degrading_services": self._get_degrading_services,
             "get_current_sli": self._get_current_sli,
             "get_slo_violations": self._get_slo_violations,
@@ -83,12 +83,6 @@ class FunctionExecutor:
         """Get services degrading over time window."""
         result = self.degradation_detector.detect_degrading_services(time_window_minutes)
         return {"degrading_services": result, "count": len(result)}
-
-    def _get_error_code_distribution(self,
-                                    service_name: str = None,
-                                    time_window_minutes: int = 30) -> Dict[str, Any]:
-        """Get error code distribution."""
-        return self.degradation_detector.get_error_code_distribution(service_name, time_window_minutes)
 
     def _get_current_sli(self, service_name: str = None) -> Dict[str, Any]:
         """Get current SLI for services."""
@@ -135,16 +129,6 @@ class FunctionExecutor:
         """Get error-prone services."""
         result = self.metrics_aggregator.get_error_prone_services(limit)
         return {"services": result, "count": len(result)}
-
-    def _get_top_errors(self, limit: int = 10) -> Dict[str, Any]:
-        """Get top error codes."""
-        result = self.metrics_aggregator.get_top_errors(limit)
-        return {"errors": result, "count": len(result)}
-
-    def _get_error_details_by_code(self, error_code: str, limit: int = 5) -> Dict[str, Any]:
-        """Get detailed error logs for a specific error code."""
-        result = self.metrics_aggregator.get_error_details_by_code(error_code, limit)
-        return {"error_code": error_code, "details": result, "count": len(result)}
 
     def _get_historical_patterns(self, service_name: str) -> Dict[str, Any]:
         """Get historical patterns for service."""
@@ -204,24 +188,6 @@ TOOLS = [
                 "time_window_minutes": {
                     "type": "integer",
                     "description": "Time window in minutes for degradation analysis (default: 30)",
-                    "default": 30
-                }
-            }
-        }
-    },
-    {
-        "name": "get_error_code_distribution",
-        "description": "Get distribution of error codes (HTTP status codes like 400, 500) for services. Shows which errors are most common.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "service_name": {
-                    "type": "string",
-                    "description": "Optional service name to filter by. If not provided, shows all services."
-                },
-                "time_window_minutes": {
-                    "type": "integer",
-                    "description": "Time window in minutes (default: 30)",
                     "default": 30
                 }
             }
@@ -356,39 +322,6 @@ TOOLS = [
                     "default": 10
                 }
             }
-        }
-    },
-    {
-        "name": "get_top_errors",
-        "description": "Get most common error codes across all services.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "limit": {
-                    "type": "integer",
-                    "description": "Number of top errors to return (default: 10)",
-                    "default": 10
-                }
-            }
-        }
-    },
-    {
-        "name": "get_error_details_by_code",
-        "description": "Get detailed error logs for a specific error code. Returns full error details including transaction names, timestamps, and complete error log entries for debugging.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "error_code": {
-                    "type": "string",
-                    "description": "The error code to search for (e.g., '404', '500', '302')"
-                },
-                "limit": {
-                    "type": "integer",
-                    "description": "Number of error details to return (default: 5)",
-                    "default": 5
-                }
-            },
-            "required": ["error_code"]
         }
     },
     {

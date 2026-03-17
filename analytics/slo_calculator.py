@@ -30,25 +30,26 @@ class SLOCalculator:
         Returns:
             DataFrame with current SLI metrics for each service
         """
-        where_clause = f"WHERE service_name = '{service_name}'" if service_name else ""
+        where_clause_join = f"WHERE e.service_name = '{service_name}'" if service_name else ""
 
         sql = f"""
             SELECT
-                service_name,
-                MAX(record_time) as last_update,
-                AVG(success_rate) as avg_success_rate,
-                AVG(error_rate) as avg_error_rate,
-                AVG(response_time_avg) as avg_response_time,
-                AVG(response_time_p50) as avg_response_time_p50,
-                AVG(response_time_p95) as avg_response_time_p95,
-                AVG(response_time_p99) as avg_response_time_p99,
-                SUM(total_count) as total_requests,
-                SUM(error_count) as total_errors,
-                MAX(target_error_slo_perc) as error_slo_target,
-                MAX(target_response_slo_sec) as response_slo_target
-            FROM service_logs
-            {where_clause}
-            GROUP BY service_name
+                e.service_name,
+                MAX(e.record_time) as last_update,
+                AVG(e.success_rate) as avg_success_rate,
+                AVG(e.error_rate) as avg_error_rate,
+                AVG(r.response_time_avg) as avg_response_time,
+                AVG(r.response_time_p50) as avg_response_time_p50,
+                AVG(r.response_time_p95) as avg_response_time_p95,
+                AVG(r.response_time_p99) as avg_response_time_p99,
+                SUM(e.total_count) as total_requests,
+                SUM(e.error_count) as total_errors,
+                MAX(e.target_error_slo_perc) as error_slo_target,
+                MAX(e.target_response_slo_sec) as response_slo_target
+            FROM service_logs_eb e
+            LEFT JOIN service_logs_response r ON e.service_name = r.service_name
+            {where_clause_join}
+            GROUP BY e.service_name
             ORDER BY total_requests DESC
         """
 

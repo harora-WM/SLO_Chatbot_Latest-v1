@@ -34,7 +34,7 @@ class MetricsAggregator:
                 SUM(total_count) as total_requests,
                 AVG(error_rate) as avg_error_rate,
                 AVG(response_time_avg) as avg_response_time
-            FROM service_logs
+            FROM service_logs_eb
             GROUP BY service_name
             ORDER BY total_requests DESC
             LIMIT {limit}
@@ -55,113 +55,77 @@ class MetricsAggregator:
 
         return results
 
-    def get_top_errors(self, limit: int = 10) -> List[Dict[str, Any]]:
-        """Get top error codes by frequency.
-
-        Args:
-            limit: Number of top errors to return
+    def get_service_health_overview(self) -> Dict[str, Any]:
+        """Get overall service health overview using API-provided health fields.
 
         Returns:
-            List of top errors
+            Dictionary with health metrics broken down by eb_health and response_health.
         """
-        sql = f"""
+        sql = """
             SELECT
-                error_codes,
-                COUNT(*) as occurrence_count,
-                SUM(error_count) as total_errors,
-                AVG(response_time_avg) as avg_response_time
-            FROM error_logs
-            WHERE error_count > 0
-            GROUP BY error_codes
-            ORDER BY total_errors DESC
-            LIMIT {limit}
+                e.service_name,
+                CASE MAX(CASE e.eb_health WHEN 'UNHEALTHY' THEN 2 WHEN 'AT_RISK' THEN 1 ELSE 0 END)
+                    WHEN 2 THEN 'UNHEALTHY' WHEN 1 THEN 'AT_RISK' ELSE 'HEALTHY' END as eb_health,
+                CASE MAX(CASE e.aspirational_eb_health WHEN 'UNHEALTHY' THEN 2 WHEN 'AT_RISK' THEN 1 ELSE 0 END)
+                    WHEN 2 THEN 'UNHEALTHY' WHEN 1 THEN 'AT_RISK' ELSE 'HEALTHY' END as aspirational_eb_health,
+                CASE MAX(CASE r.response_health WHEN 'UNHEALTHY' THEN 2 WHEN 'AT_RISK' THEN 1 ELSE 0 END)
+                    WHEN 2 THEN 'UNHEALTHY' WHEN 1 THEN 'AT_RISK' ELSE 'HEALTHY' END as response_health,
+                CASE MAX(CASE r.aspirational_response_health WHEN 'UNHEALTHY' THEN 2 WHEN 'AT_RISK' THEN 1 ELSE 0 END)
+                    WHEN 2 THEN 'UNHEALTHY' WHEN 1 THEN 'AT_RISK' ELSE 'HEALTHY' END as aspirational_response_health,
+                SUM(e.total_count) as total_requests,
+                SUM(e.error_count) as total_errors
+            FROM service_logs_eb e
+            LEFT JOIN service_logs_response r ON e.service_name = r.service_name
+            GROUP BY e.service_name
         """
-
         df = self.db_manager.query(sql)
 
-        results = []
-        for _, row in df.iterrows():
-            # Handle NaN values safely
-            occ_count = row['occurrence_count']
-            tot_errors = row['total_errors']
-            results.append({
-                'error_code': row['error_codes'],
-                'occurrence_count': int(occ_count) if pd.notna(occ_count) else 0,
-                'total_errors': int(tot_errors) if pd.notna(tot_errors) else 0,
-                'avg_response_time': row['avg_response_time'] if pd.notna(row['avg_response_time']) else 0.0
-            })
-
-        return results
-
-    def get_service_health_overview(self) -> Dict[str, Any]:
-        """Get overall service health overview.
-
-        Returns:
-            Dictionary with health metrics
-        """
-        # Total services
-        total_services = len(self.db_manager.get_all_services())
-
-        # Services meeting SLO
-        slo_sql = """
-            SELECT
-                service_name,
-                AVG(error_rate) as avg_error_rate,
-                AVG(response_time_avg) as avg_response_time,
-                MAX(target_error_slo_perc) as error_slo_target,
-                MAX(target_response_slo_sec) as response_slo_target
-            FROM service_logs
-            GROUP BY service_name
-        """
-
-        df = self.db_manager.query(slo_sql)
-
-        healthy_count = 0
-        degraded_count = 0
-        violated_count = 0
+        total_services = len(df)
+        eb_healthy = eb_at_risk = eb_unhealthy = 0
+        response_healthy = response_unhealthy = 0
+        total_requests = 0
+        total_errors = 0
 
         for _, row in df.iterrows():
-            error_slo_met = row['avg_error_rate'] <= row['error_slo_target']
-            response_slo_met = row['avg_response_time'] <= row['response_slo_target']
+            eb_h = row['eb_health'] if pd.notna(row['eb_health']) else 'UNKNOWN'
+            resp_h = row['response_health'] if pd.notna(row['response_health']) else 'UNKNOWN'
 
-            if error_slo_met and response_slo_met:
-                healthy_count += 1
-            elif not error_slo_met or not response_slo_met:
-                if row['avg_error_rate'] > row['error_slo_target'] * 0.8 or \
-                   row['avg_response_time'] > row['response_slo_target'] * 0.8:
-                    degraded_count += 1
-                else:
-                    violated_count += 1
+            if eb_h == 'HEALTHY':
+                eb_healthy += 1
+            elif eb_h == 'AT_RISK':
+                eb_at_risk += 1
+            else:
+                eb_unhealthy += 1
 
-        # Total requests and errors
-        totals_sql = """
-            SELECT
-                SUM(total_count) as total_requests,
-                SUM(error_count) as total_errors
-            FROM service_logs
-        """
+            if resp_h == 'HEALTHY':
+                response_healthy += 1
+            else:
+                response_unhealthy += 1
 
-        totals_df = self.db_manager.query(totals_sql)
-
-        # Handle NaN values from empty table
-        if not totals_df.empty and pd.notna(totals_df['total_requests'].iloc[0]):
-            total_requests = int(totals_df['total_requests'].iloc[0])
-            total_errors = int(totals_df['total_errors'].iloc[0])
-        else:
-            total_requests = 0
-            total_errors = 0
+            total_requests += int(row['total_requests']) if pd.notna(row['total_requests']) else 0
+            total_errors += int(row['total_errors']) if pd.notna(row['total_errors']) else 0
 
         overall_error_rate = (total_errors / total_requests * 100) if total_requests > 0 else 0
 
         return {
             'total_services': total_services,
-            'healthy_services': healthy_count,
-            'degraded_services': degraded_count,
-            'violated_services': violated_count,
+            # EB health breakdown
+            'eb_healthy_services': eb_healthy,
+            'eb_at_risk_services': eb_at_risk,
+            'eb_unhealthy_services': eb_unhealthy,
+            # Response health breakdown
+            'response_healthy_services': response_healthy,
+            'response_unhealthy_services': response_unhealthy,
+            # Legacy keys kept for compatibility with existing UI/prompts
+            'healthy_services': eb_healthy,
+            'degraded_services': eb_at_risk,
+            'violated_services': eb_unhealthy,
+            'unhealthy_services': eb_unhealthy,
+            # Totals
             'total_requests': total_requests,
             'total_errors': total_errors,
             'overall_error_rate': overall_error_rate,
-            'health_percentage': (healthy_count / total_services * 100) if total_services > 0 else 0
+            'health_percentage': (eb_healthy / total_services * 100) if total_services > 0 else 0
         }
 
     def get_slowest_services(self, limit: int = 10) -> List[Dict[str, Any]]:
@@ -183,7 +147,7 @@ class MetricsAggregator:
                 MAX(response_time_max) as max_response_time,
                 MAX(target_response_slo_sec) as response_slo_target,
                 SUM(total_count) as total_requests
-            FROM service_logs
+            FROM service_logs_response
             GROUP BY service_name
             ORDER BY COALESCE(avg_p99, avg_response_time) DESC
             LIMIT {limit}
@@ -234,7 +198,7 @@ class MetricsAggregator:
                 SUM(error_count) as total_errors,
                 SUM(total_count) as total_requests,
                 MAX(target_error_slo_perc) as error_slo_target
-            FROM service_logs
+            FROM service_logs_eb
             GROUP BY service_name
             HAVING avg_error_rate > 0
             ORDER BY avg_error_rate DESC
@@ -261,47 +225,7 @@ class MetricsAggregator:
 
         return results
 
-    def get_error_details_by_code(self, error_code: str, limit: int = 5) -> List[Dict[str, Any]]:
-        """Get detailed error logs for a specific error code.
-
-        Args:
-            error_code: Error code to search for
-            limit: Number of error details to return
-
-        Returns:
-            List of error details with full log information
-        """
-        sql = f"""
-            SELECT
-                wm_transaction_name,
-                error_codes,
-                error_details,
-                response_time_avg,
-                record_time,
-                wm_application_name
-            FROM error_logs
-            WHERE error_codes = '{error_code}'
-                AND error_details IS NOT NULL
-            ORDER BY record_time DESC
-            LIMIT {limit}
-        """
-
-        df = self.db_manager.query(sql)
-
-        results = []
-        for _, row in df.iterrows():
-            results.append({
-                'transaction_name': row['wm_transaction_name'] if pd.notna(row['wm_transaction_name']) else 'Unknown',
-                'error_code': row['error_codes'],
-                'error_details': row['error_details'] if pd.notna(row['error_details']) else 'No details available',
-                'response_time': row['response_time_avg'] if pd.notna(row['response_time_avg']) else 0.0,
-                'timestamp': str(row['record_time']),
-                'application': row['wm_application_name'] if pd.notna(row['wm_application_name']) else 'Unknown'
-            })
-
-        return results
-
-    # ==================== NEW PLATFORM API FUNCTIONS ====================
+    # ==================== PLATFORM API FUNCTIONS ====================
     # The following functions leverage the extended schema with burn rate,
     # health indicators, aspirational SLO metrics, and timeliness tracking
 
@@ -323,8 +247,9 @@ class MetricsAggregator:
                 AVG(eb_actual_consumed_percent) as avg_eb_consumed,
                 AVG(eb_left_percent) as avg_eb_left,
                 AVG(error_rate) as avg_error_rate,
-                MAX(eb_health) as eb_health
-            FROM service_logs
+                CASE MAX(CASE eb_health WHEN 'UNHEALTHY' THEN 2 WHEN 'AT_RISK' THEN 1 ELSE 0 END)
+                    WHEN 2 THEN 'UNHEALTHY' WHEN 1 THEN 'AT_RISK' ELSE 'HEALTHY' END as eb_health
+            FROM service_logs_eb
             GROUP BY service_name
             HAVING avg_burn_rate > 0
             ORDER BY avg_burn_rate DESC
@@ -361,14 +286,29 @@ class MetricsAggregator:
                 aspirational_eb_health,
                 response_health,
                 aspirational_response_health,
-                AVG(eb_actual_consumed_percent) as std_eb_consumed,
-                AVG(aspirational_eb_actual_consumed_percent) as asp_eb_consumed,
-                AVG(burn_rate) as avg_burn_rate
-            FROM service_logs
+                std_eb_consumed,
+                asp_eb_consumed,
+                avg_burn_rate
+            FROM (
+                SELECT
+                    e.service_name,
+                    CASE MAX(CASE e.eb_health WHEN 'UNHEALTHY' THEN 2 WHEN 'AT_RISK' THEN 1 ELSE 0 END)
+                        WHEN 2 THEN 'UNHEALTHY' WHEN 1 THEN 'AT_RISK' ELSE 'HEALTHY' END as eb_health,
+                    CASE MAX(CASE e.aspirational_eb_health WHEN 'UNHEALTHY' THEN 2 WHEN 'AT_RISK' THEN 1 ELSE 0 END)
+                        WHEN 2 THEN 'UNHEALTHY' WHEN 1 THEN 'AT_RISK' ELSE 'HEALTHY' END as aspirational_eb_health,
+                    CASE MAX(CASE r.response_health WHEN 'UNHEALTHY' THEN 2 WHEN 'AT_RISK' THEN 1 ELSE 0 END)
+                        WHEN 2 THEN 'UNHEALTHY' WHEN 1 THEN 'AT_RISK' ELSE 'HEALTHY' END as response_health,
+                    CASE MAX(CASE r.aspirational_response_health WHEN 'UNHEALTHY' THEN 2 WHEN 'AT_RISK' THEN 1 ELSE 0 END)
+                        WHEN 2 THEN 'UNHEALTHY' WHEN 1 THEN 'AT_RISK' ELSE 'HEALTHY' END as aspirational_response_health,
+                    AVG(e.eb_actual_consumed_percent) as std_eb_consumed,
+                    AVG(e.aspirational_eb_actual_consumed_percent) as asp_eb_consumed,
+                    AVG(e.burn_rate) as avg_burn_rate
+                FROM service_logs_eb e
+                LEFT JOIN service_logs_response r ON e.service_name = r.service_name
+                GROUP BY e.service_name
+            ) s
             WHERE (eb_health = 'HEALTHY' AND aspirational_eb_health = 'UNHEALTHY')
                OR (response_health = 'HEALTHY' AND aspirational_response_health = 'UNHEALTHY')
-            GROUP BY service_name, eb_health, aspirational_eb_health,
-                     response_health, aspirational_response_health
         """
 
         df = self.db_manager.query(sql)
@@ -404,7 +344,7 @@ class MetricsAggregator:
                 AVG(timeliness_consumed_percent) as avg_timeliness_consumed,
                 AVG(response_time_p95) as avg_p95,
                 AVG(error_rate) as avg_error_rate
-            FROM service_logs
+            FROM service_logs_eb
             WHERE timeliness_health = 'UNHEALTHY'
             GROUP BY service_name, timeliness_health, response_health
         """
@@ -437,24 +377,25 @@ class MetricsAggregator:
         Returns:
             List of services with breach vs error analysis
         """
-        where_clause = f"WHERE service_name = '{service_name}'" if service_name else ""
+        where_clause = f"WHERE e.service_name = '{service_name}'" if service_name else ""
 
         sql = f"""
             SELECT
-                service_name,
-                AVG(response_error_rate) as avg_breach_rate,
-                AVG(error_rate) as avg_error_rate,
-                AVG(response_breach_count) as avg_breach_count,
-                AVG(error_count) as avg_error_count,
-                AVG(response_time_p95) as avg_p95,
+                e.service_name,
+                AVG(r.response_error_rate) as avg_breach_rate,
+                AVG(e.error_rate) as avg_error_rate,
+                AVG(r.response_breach_count) as avg_breach_count,
+                AVG(e.error_count) as avg_error_count,
+                AVG(r.response_time_p95) as avg_p95,
                 CASE
-                    WHEN AVG(response_error_rate) > AVG(error_rate) THEN 'LATENCY_ISSUE'
-                    WHEN AVG(error_rate) > AVG(response_error_rate) THEN 'RELIABILITY_ISSUE'
+                    WHEN AVG(r.response_error_rate) > AVG(e.error_rate) THEN 'LATENCY_ISSUE'
+                    WHEN AVG(e.error_rate) > AVG(r.response_error_rate) THEN 'RELIABILITY_ISSUE'
                     ELSE 'BALANCED'
                 END as issue_type
-            FROM service_logs
+            FROM service_logs_eb e
+            LEFT JOIN service_logs_response r ON e.service_name = r.service_name
             {where_clause}
-            GROUP BY service_name
+            GROUP BY e.service_name
             ORDER BY avg_breach_rate DESC
         """
 
@@ -494,7 +435,7 @@ class MetricsAggregator:
                 burn_rate,
                 eb_health,
                 AVG(error_rate) as avg_error_rate
-            FROM service_logs
+            FROM service_logs_eb
             WHERE eb_actual_consumed_percent >= 100 OR eb_left_count < 0
             GROUP BY service_name, eb_actual_consumed_percent, eb_left_count,
                      aspirational_eb_actual_consumed_percent, burn_rate, eb_health
@@ -530,7 +471,6 @@ class MetricsAggregator:
         sql = """
             SELECT
                 service_name,
-                -- Count healthy dimensions (0-5)
                 (CASE WHEN eb_health = 'HEALTHY' THEN 1 ELSE 0 END +
                  CASE WHEN response_health = 'HEALTHY' THEN 1 ELSE 0 END +
                  CASE WHEN timeliness_health = 'HEALTHY' THEN 1 ELSE 0 END +
@@ -541,10 +481,25 @@ class MetricsAggregator:
                 timeliness_health,
                 aspirational_eb_health,
                 aspirational_response_health,
-                AVG(burn_rate) as avg_burn_rate
-            FROM service_logs
-            GROUP BY service_name, eb_health, response_health, timeliness_health,
-                     aspirational_eb_health, aspirational_response_health
+                avg_burn_rate
+            FROM (
+                SELECT
+                    e.service_name,
+                    CASE MAX(CASE e.eb_health WHEN 'UNHEALTHY' THEN 2 WHEN 'AT_RISK' THEN 1 ELSE 0 END)
+                        WHEN 2 THEN 'UNHEALTHY' WHEN 1 THEN 'AT_RISK' ELSE 'HEALTHY' END as eb_health,
+                    CASE MAX(CASE r.response_health WHEN 'UNHEALTHY' THEN 2 WHEN 'AT_RISK' THEN 1 ELSE 0 END)
+                        WHEN 2 THEN 'UNHEALTHY' WHEN 1 THEN 'AT_RISK' ELSE 'HEALTHY' END as response_health,
+                    CASE MAX(CASE e.timeliness_health WHEN 'UNHEALTHY' THEN 2 WHEN 'AT_RISK' THEN 1 ELSE 0 END)
+                        WHEN 2 THEN 'UNHEALTHY' WHEN 1 THEN 'AT_RISK' ELSE 'HEALTHY' END as timeliness_health,
+                    CASE MAX(CASE e.aspirational_eb_health WHEN 'UNHEALTHY' THEN 2 WHEN 'AT_RISK' THEN 1 ELSE 0 END)
+                        WHEN 2 THEN 'UNHEALTHY' WHEN 1 THEN 'AT_RISK' ELSE 'HEALTHY' END as aspirational_eb_health,
+                    CASE MAX(CASE r.aspirational_response_health WHEN 'UNHEALTHY' THEN 2 WHEN 'AT_RISK' THEN 1 ELSE 0 END)
+                        WHEN 2 THEN 'UNHEALTHY' WHEN 1 THEN 'AT_RISK' ELSE 'HEALTHY' END as aspirational_response_health,
+                    AVG(e.burn_rate) as avg_burn_rate
+                FROM service_logs_eb e
+                LEFT JOIN service_logs_response r ON e.service_name = r.service_name
+                GROUP BY e.service_name
+            ) s
             ORDER BY healthy_dimensions ASC, avg_burn_rate DESC
         """
 
@@ -580,26 +535,27 @@ class MetricsAggregator:
         """
         sql = """
             SELECT
-                service_name,
+                e.service_name,
                 -- Count red indicators (#FD346E)
-                (CASE WHEN response_severity = '#FD346E' THEN 1 ELSE 0 END +
-                 CASE WHEN eb_severity = '#FD346E' THEN 1 ELSE 0 END +
-                 CASE WHEN timeliness_severity = '#FD346E' THEN 1 ELSE 0 END +
-                 CASE WHEN aspirational_response_severity = '#FD346E' THEN 1 ELSE 0 END +
-                 CASE WHEN aspirational_eb_severity = '#FD346E' THEN 1 ELSE 0 END) as red_count,
+                (CASE WHEN r.response_severity = '#FD346E' THEN 1 ELSE 0 END +
+                 CASE WHEN e.eb_severity = '#FD346E' THEN 1 ELSE 0 END +
+                 CASE WHEN e.timeliness_severity = '#FD346E' THEN 1 ELSE 0 END +
+                 CASE WHEN r.aspirational_response_severity = '#FD346E' THEN 1 ELSE 0 END +
+                 CASE WHEN e.aspirational_eb_severity = '#FD346E' THEN 1 ELSE 0 END) as red_count,
                 -- Count green indicators (#07AE86)
-                (CASE WHEN response_severity = '#07AE86' THEN 1 ELSE 0 END +
-                 CASE WHEN eb_severity = '#07AE86' THEN 1 ELSE 0 END +
-                 CASE WHEN timeliness_severity = '#07AE86' THEN 1 ELSE 0 END +
-                 CASE WHEN aspirational_response_severity = '#07AE86' THEN 1 ELSE 0 END +
-                 CASE WHEN aspirational_eb_severity = '#07AE86' THEN 1 ELSE 0 END) as green_count,
-                response_severity,
-                eb_severity,
-                timeliness_severity,
-                AVG(burn_rate) as avg_burn_rate
-            FROM service_logs
-            GROUP BY service_name, response_severity, eb_severity, timeliness_severity,
-                     aspirational_response_severity, aspirational_eb_severity
+                (CASE WHEN r.response_severity = '#07AE86' THEN 1 ELSE 0 END +
+                 CASE WHEN e.eb_severity = '#07AE86' THEN 1 ELSE 0 END +
+                 CASE WHEN e.timeliness_severity = '#07AE86' THEN 1 ELSE 0 END +
+                 CASE WHEN r.aspirational_response_severity = '#07AE86' THEN 1 ELSE 0 END +
+                 CASE WHEN e.aspirational_eb_severity = '#07AE86' THEN 1 ELSE 0 END) as green_count,
+                r.response_severity,
+                e.eb_severity,
+                e.timeliness_severity,
+                AVG(e.burn_rate) as avg_burn_rate
+            FROM service_logs_eb e
+            LEFT JOIN service_logs_response r ON e.service_name = r.service_name
+            GROUP BY e.service_name, r.response_severity, e.eb_severity, e.timeliness_severity,
+                     r.aspirational_response_severity, e.aspirational_eb_severity
             ORDER BY red_count DESC, avg_burn_rate DESC
         """
 
@@ -633,13 +589,31 @@ class MetricsAggregator:
         sql = """
             SELECT
                 service_name,
-                eb_slo_status,
-                AVG(burn_rate) as avg_burn_rate,
+                avg_burn_rate,
                 eb_health,
-                response_health
-            FROM service_logs
-            WHERE eb_slo_status = 'UNDER_REVIEW'
-            GROUP BY service_name, eb_slo_status, eb_health, response_health
+                response_health,
+                eb_breached,
+                eb_left_percent,
+                CASE
+                    WHEN eb_health = 'UNHEALTHY' AND avg_burn_rate > 5.0 THEN 'CRITICAL'
+                    WHEN eb_health = 'UNHEALTHY' THEN 'NEEDS_REVIEW'
+                    WHEN eb_health = 'AT_RISK' THEN 'AT_RISK'
+                    ELSE 'HEALTHY'
+                END as governance_status
+            FROM (
+                SELECT
+                    service_name,
+                    AVG(burn_rate) as avg_burn_rate,
+                    CASE MAX(CASE eb_health WHEN 'UNHEALTHY' THEN 2 WHEN 'AT_RISK' THEN 1 ELSE 0 END)
+                        WHEN 2 THEN 'UNHEALTHY' WHEN 1 THEN 'AT_RISK' ELSE 'HEALTHY' END as eb_health,
+                    CASE MAX(CASE response_health WHEN 'UNHEALTHY' THEN 2 WHEN 'AT_RISK' THEN 1 ELSE 0 END)
+                        WHEN 2 THEN 'UNHEALTHY' WHEN 1 THEN 'AT_RISK' ELSE 'HEALTHY' END as response_health,
+                    MAX(CAST(eb_breached AS INTEGER)) > 0 as eb_breached,
+                    AVG(eb_left_percent) as eb_left_percent
+                FROM service_logs_eb
+                GROUP BY service_name
+            ) s
+            WHERE eb_health IN ('UNHEALTHY', 'AT_RISK')
             ORDER BY avg_burn_rate DESC
         """
 
@@ -649,10 +623,12 @@ class MetricsAggregator:
         for _, row in df.iterrows():
             results.append({
                 'service_name': row['service_name'],
-                'eb_slo_status': row['eb_slo_status'],
+                'governance_status': row['governance_status'] if pd.notna(row['governance_status']) else 'UNKNOWN',
                 'avg_burn_rate': row['avg_burn_rate'] if pd.notna(row['avg_burn_rate']) else 0.0,
                 'eb_health': row['eb_health'] if pd.notna(row['eb_health']) else 'UNKNOWN',
-                'response_health': row['response_health'] if pd.notna(row['response_health']) else 'UNKNOWN'
+                'response_health': row['response_health'] if pd.notna(row['response_health']) else 'UNKNOWN',
+                'eb_breached': bool(row['eb_breached']) if pd.notna(row['eb_breached']) else False,
+                'eb_left_percent': row['eb_left_percent'] if pd.notna(row['eb_left_percent']) else 0.0
             })
 
         return results

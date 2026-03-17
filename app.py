@@ -26,15 +26,7 @@ from agent.function_tools import FunctionExecutor, TOOLS
 from utils.logger import setup_logger
 from utils.config import DEFAULT_TIME_WINDOW_DAYS, MAX_TIME_WINDOW_DAYS
 
-# logger = setup_logger(__name__)
-
-# Page configuration
-st.set_page_config(
-    page_title="SLO Chatbot",
-    page_icon="📊",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
+logger = setup_logger(__name__)
 
 # Custom CSS
 st.markdown("""
@@ -106,23 +98,6 @@ def initialize_system():
         'claude_client': claude_client,
         'data_loader': data_loader
     }
-
-
-# JSON file loading removed - data now only comes from OpenSearch
-# def load_initial_data(data_loader):
-#     """Load initial data from JSON files."""
-#     service_logs_path = PROJECT_ROOT / "ServiceLogs7Amto11Am31Dec2025.json"
-#     error_logs_path = PROJECT_ROOT / "ErrorLogs7Amto11Am31Dec2025.json"
-#
-#     if service_logs_path.exists() and error_logs_path.exists():
-#         with st.spinner("Loading service and error logs..."):
-#             data_loader.load_and_store_all(str(service_logs_path), str(error_logs_path))
-#         st.success("Data loaded successfully!")
-#         return True
-#     else:
-#         st.error("Log files not found!")
-#         return False
-
 
 
 def display_chat(components):
@@ -232,11 +207,6 @@ AVAILABLE TOOLS (20 functions):
 **Performance Patterns:**
 - get_volume_trends(service_name, time_window_minutes) - Traffic patterns
 - get_historical_patterns(service_name) - Statistical analysis
-
-**DEPRECATED (error_logs table no longer exists):**
-- get_error_code_distribution() - Not available with Platform API
-- get_top_errors() - Use error_count from service_logs instead
-- get_error_details_by_code() - Not available (data is aggregated)
 
 OUTPUT FORMAT (STRICT):
 
@@ -393,7 +363,7 @@ def main():
         # Time range selection
         time_range_option = st.selectbox(
             "Time Range",
-            ["Last 5 days", "Last 7 days", "Last 30 days", "Last 60 days", "Custom"],
+            ["Last 5 days", "Last 7 days", "Last 15 days", "Last 30 days", "Last 60 days", "Custom"],
             index=1  # Default to 7 days
         )
 
@@ -409,21 +379,25 @@ def main():
         if st.button("🔄 Refresh from Platform API"):
             with st.spinner("Fetching aggregated SLO metrics from Platform API..."):
                 try:
-                    # Calculate time range
-                    from datetime import datetime, timedelta
-                    end_time_dt = datetime.now()
+                    # Calculate time range — snap to day boundaries (start of day / start of next day)
+                    from datetime import datetime, timedelta, time as dt_time
+                    today = datetime.now().date()
+                    # end = start of tomorrow (covers all of today)
+                    end_time_dt = datetime.combine(today + timedelta(days=1), dt_time.min)
 
                     if time_range_option == "Last 5 days":
-                        start_time_dt = end_time_dt - timedelta(days=5)
+                        start_time_dt = datetime.combine(today - timedelta(days=5), dt_time.min)
                     elif time_range_option == "Last 7 days":
-                        start_time_dt = end_time_dt - timedelta(days=7)
+                        start_time_dt = datetime.combine(today - timedelta(days=7), dt_time.min)
+                    elif time_range_option == "Last 15 days":
+                        start_time_dt = datetime.combine(today - timedelta(days=15), dt_time.min)
                     elif time_range_option == "Last 30 days":
-                        start_time_dt = end_time_dt - timedelta(days=30)
+                        start_time_dt = datetime.combine(today - timedelta(days=30), dt_time.min)
                     elif time_range_option == "Last 60 days":
-                        start_time_dt = end_time_dt - timedelta(days=60)
+                        start_time_dt = datetime.combine(today - timedelta(days=60), dt_time.min)
                     else:  # Custom
-                        start_time_dt = datetime.combine(start_date, datetime.min.time())
-                        end_time_dt = datetime.combine(end_date, datetime.max.time())
+                        start_time_dt = datetime.combine(start_date, dt_time.min)
+                        end_time_dt = datetime.combine(end_date + timedelta(days=1), dt_time.min)
 
                         # Validate time range
                         time_diff = end_time_dt - start_time_dt
@@ -447,14 +421,19 @@ def main():
                     )
 
                     # Load into database
-                    df = components['data_loader'].load_service_logs_from_platform_api(api_response)
-                    components['db_manager'].insert_service_logs(df)
+                    eb_df, response_df = components['data_loader'].load_service_logs_from_platform_api(api_response)
+                    components['db_manager'].insert_service_logs(eb_df)
+                    components['db_manager'].insert_service_logs_response(response_df)
 
-                    st.success(f"✅ Loaded {len(api_response):,} services with {len(df):,} data points ({len(df.columns)} metrics per service)")
+                    st.success(f"✅ Loaded {len(api_response):,} services | EB: {len(eb_df):,} records, Response: {len(response_df):,} records ({len(eb_df.columns)} metrics per service)")
+
+                    # Store the actual API query range in session state
+                    st.session_state['data_start_time'] = start_time_dt
+                    st.session_state['data_end_time'] = end_time_dt
 
                     # Show health summary
-                    unhealthy_count = len(df[df['eb_health'] == 'UNHEALTHY'])
-                    high_burn_rate = len(df[df['burn_rate'] > 2.0])
+                    unhealthy_count = len(eb_df[eb_df['eb_health'] == 'UNHEALTHY'])
+                    high_burn_rate = len(eb_df[eb_df['burn_rate'] > 2.0])
                     if unhealthy_count > 0 or high_burn_rate > 0:
                         st.warning(f"⚠️ Found {unhealthy_count} unhealthy services and {high_burn_rate} services with high burn rate")
 
@@ -468,11 +447,10 @@ def main():
 
         # Data info
         try:
-            time_range = components['db_manager'].get_time_range()
-            if time_range['min_time'] and time_range['max_time']:
+            if st.session_state.get('data_start_time') and st.session_state.get('data_end_time'):
                 st.markdown("### 📅 Data Time Range")
-                st.write(f"**From:** {time_range['min_time']}")
-                st.write(f"**To:** {time_range['max_time']}")
+                st.write(f"**From:** {st.session_state['data_start_time'].strftime('%Y-%m-%d %H:%M:%S')}")
+                st.write(f"**To:** {st.session_state['data_end_time'].strftime('%Y-%m-%d %H:%M:%S')}")
 
             all_services = components['db_manager'].get_all_services()
             st.markdown(f"### 📊 Total Services: {len(all_services)}")

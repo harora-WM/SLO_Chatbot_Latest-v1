@@ -7,7 +7,6 @@ the access token every 4 minutes in a background thread to ensure continuous API
 
 import requests
 import threading
-import time
 import urllib3
 from datetime import datetime, timedelta
 from typing import Optional
