@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Overview
 
-**SLO Chatbot** - AI-powered Service Level Objective monitoring using Claude Sonnet 4.5 via AWS Bedrock. Analyzes daily aggregated SLO metrics from WM Platform API with 20 analytics functions.
+**SLO Chatbot** - AI-powered Service Level Objective monitoring using Claude Sonnet 4.5 via AWS Bedrock (cross-region inference, `global.` prefix). Analyzes daily aggregated SLO metrics from WM Platform API with 20 analytics functions.
 
 **Stack:** Streamlit + DuckDB (OLAP) + AWS Bedrock + Platform API (Keycloak OAuth2)
 
@@ -18,6 +18,8 @@ cp .env.example .env  # Configure: AWS Bedrock, Keycloak, Platform API
 
 # Run
 streamlit run app.py
+# or
+./run.sh  # Wrapper that activates venv + starts Streamlit
 
 # Tests
 python test_platform_api.py      # Full Platform API suite (auth + API + 20 functions)
@@ -44,9 +46,11 @@ find . -type d -name "__pycache__" -exec rm -r {} + && streamlit run app.py
 - `agent/function_tools.py` - Function dispatcher (20 tools)
 - `app.py` - Streamlit UI (`@st.cache_resource` for all components)
 
-**LLM Interface:** `ClaudeClient.chat_stream()` is the primary entry point — yields text chunks for real-time rendering. Internally calls `send_message()` then loops through tool calls via `handle_tool_use()` (max 5 iterations).
+**LLM Interface:** `ClaudeClient.chat_stream()` is the primary entry point — yields text chunks for real-time rendering. Internally calls `send_message()` then loops through tool calls via `handle_tool_use()` (max 5 iterations). The system prompt in `app.py` `display_chat()` restricts the chatbot to SLO-related questions only — it explicitly declines off-topic queries.
 
 **Data Loading:** Data is NOT auto-loaded. Users click "Refresh from Platform API" in the sidebar to fetch data for a selected time range (5–60 days). Token auto-refresh runs in a background daemon thread.
+
+**Streamlit Cache:** All components use `@st.cache_resource` (singletons per session). After code changes, clear cache with the pycache command above and restart — browser refresh alone is insufficient.
 
 ## Critical Code Patterns
 
@@ -116,9 +120,14 @@ PLATFORM_API_APPLICATION=WMPlatform
 PLATFORM_API_APPLICATION_ID=31854
 PLATFORM_API_PROJECT_ID=215853
 PLATFORM_API_PAGE_SIZE=200, PLATFORM_API_VERIFY_SSL=False
+
+# Optional overrides
+DEFAULT_TIME_WINDOW_DAYS=5, MAX_TIME_WINDOW_DAYS=60
+LOG_LEVEL=INFO
 ```
 
-**SLO Thresholds** (`utils/config.py`): Standard 98%, Aspirational 99%, Burn rate >2.0 (high risk), >5.0 (critical)
+**SLO Thresholds** (`utils/config.py`): Standard 98%, Response time 1.0s, Degradation trigger 20% change
+**Burn rate severity** (`analytics/slo_calculator.py`): `<1` (healthy), `<2` (warning), `<10` (critical), `>=10` (emergency)
 
 ## Database Schema
 
@@ -184,7 +193,4 @@ PLATFORM_API_PAGE_SIZE=200, PLATFORM_API_VERIFY_SSL=False
 
 **Python Version:** 3.12 (`.python-version` file)
 
-**Common Issues:**
-- URL typo: `wmerrorbudgetstatisticsservice` (not "statstics")
-- Hostname: `wm-sandbox-1.watermelon.us` (with hyphens)
-- TOML format: URLs on single line, no leading spaces
+**Secrets format** (`secrets.toml`): URLs must be on a single line with no leading spaces. Use `[section]` headers matching env var groups above.

@@ -104,11 +104,12 @@ def display_chat(components):
     """Display chat interface."""
     st.markdown("<h2>💬 SLO Assistant</h2>", unsafe_allow_html=True)
 
-    # Initialize chat history
+    # Initialize chat history (per-session — avoids sharing conversation_history
+    # across users via @st.cache_resource which would corrupt all sessions)
     if 'messages' not in st.session_state:
         st.session_state.messages = []
-        # Also clear Claude's internal history when session starts
-        components['claude_client'].clear_history()
+    if 'claude_history' not in st.session_state:
+        st.session_state.claude_history = []
 
     # Display chat history
     for message in st.session_state.messages:
@@ -320,6 +321,11 @@ BAD: "Service Z has errors causing slow response" (WRONG - confuses breach with 
         # Get Claude response with streaming
         with st.chat_message("assistant"):
             try:
+                # Restore this session's conversation history before the call.
+                # ClaudeClient is shared via @st.cache_resource; without this,
+                # conversation_history is shared across all users and sessions.
+                components['claude_client'].conversation_history = list(st.session_state.claude_history)
+
                 # Use streaming for real-time response generation
                 response_placeholder = st.empty()
                 full_response = ""
@@ -336,6 +342,9 @@ BAD: "Service Z has errors causing slow response" (WRONG - confuses breach with 
                 # Final update without cursor
                 response_placeholder.markdown(full_response)
                 st.session_state.messages.append({"role": "assistant", "content": full_response})
+
+                # Persist the updated history back to session state
+                st.session_state.claude_history = list(components['claude_client'].conversation_history)
 
             except Exception as e:
                 error_msg = f"Error: {str(e)}"
@@ -463,7 +472,7 @@ def main():
         # Clear chat
         if st.button("🗑️ Clear Chat History"):
             st.session_state.messages = []
-            components['claude_client'].clear_history()
+            st.session_state.claude_history = []
             st.success("Chat history cleared!")
 
         # Sample questions

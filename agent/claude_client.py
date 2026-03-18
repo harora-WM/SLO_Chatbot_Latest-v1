@@ -298,6 +298,10 @@ class ClaudeClient:
         Yields:
             Text chunks as they are generated
         """
+        # Sanitize history before use to remove any dangling tool_use blocks
+        # from a previous interrupted request.
+        self._sanitize_history()
+
         # Add user message to history
         self.conversation_history.append({
             "role": "user",
@@ -460,6 +464,30 @@ class ClaudeClient:
 
         if iterations >= max_tool_iterations:
             logger.warning(f"Reached max tool iterations ({max_tool_iterations})")
+
+    def _sanitize_history(self):
+        """Remove dangling tool_use blocks that lack a following tool_result message.
+
+        This can happen when an exception interrupts a streaming response after
+        the assistant message (with tool_use blocks) is appended but before the
+        tool_result user message is. Sending such history to Bedrock causes
+        ValidationException: tool_use ids found without tool_result blocks.
+        """
+        i = 0
+        while i < len(self.conversation_history):
+            msg = self.conversation_history[i]
+            if msg.get('role') == 'assistant':
+                content = msg.get('content', [])
+                if isinstance(content, list) and any(b.get('type') == 'tool_use' for b in content):
+                    next_idx = i + 1
+                    next_msg = self.conversation_history[next_idx] if next_idx < len(self.conversation_history) else None
+                    next_content = next_msg.get('content', []) if next_msg else []
+                    has_results = isinstance(next_content, list) and any(b.get('type') == 'tool_result' for b in next_content)
+                    if not has_results:
+                        logger.warning(f"Sanitizing corrupted history: removing {len(self.conversation_history) - i} trailing messages with dangling tool_use blocks")
+                        self.conversation_history = self.conversation_history[:i]
+                        break
+            i += 1
 
     def clear_history(self):
         """Clear conversation history."""
